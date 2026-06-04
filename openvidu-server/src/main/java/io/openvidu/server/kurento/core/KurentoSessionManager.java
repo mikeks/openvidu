@@ -77,6 +77,7 @@ import io.openvidu.server.kurento.endpoint.KurentoFilter;
 import io.openvidu.server.kurento.endpoint.PublisherEndpoint;
 import io.openvidu.server.kurento.kms.Kms;
 import io.openvidu.server.kurento.kms.KmsManager;
+import io.openvidu.server.recording.service.EvidenceRecordingService;
 import io.openvidu.server.rpc.RpcHandler;
 import io.openvidu.server.utils.GeoLocation;
 import io.openvidu.server.utils.JsonUtils;
@@ -101,6 +102,9 @@ public class KurentoSessionManager extends SessionManager {
 
 	@Autowired
 	private CallDetailRecord CDR;
+
+	@Autowired
+	private EvidenceRecordingService evidenceRecordingService;
 
 	@Override
 	/* Protected by Session.closingLock.readLock */
@@ -222,6 +226,8 @@ public class KurentoSessionManager extends SessionManager {
 		try {
 			if (session.joinLeaveLock.tryLock(15, TimeUnit.SECONDS)) {
 				try {
+
+					evidenceRecordingService.stopContinuousIfParticipant(participant);
 
 					session.leave(participant.getParticipantPrivateId(), reason);
 
@@ -493,6 +499,7 @@ public class KurentoSessionManager extends SessionManager {
 
 		participant.setPublishedAt(new Timestamp(System.currentTimeMillis()).getTime());
 		kSession.newPublisher(participant);
+		evidenceRecordingService.startContinuousIfEligible(kSession, participant);
 
 		participants = kParticipant.getSession().getParticipants();
 
@@ -521,6 +528,8 @@ public class KurentoSessionManager extends SessionManager {
 				throw new OpenViduException(Code.USER_NOT_STREAMING_ERROR_CODE,
 						"Participant '" + participant.getParticipantPublicId() + "' is not streaming media");
 			}
+			evidenceRecordingService.stopContinuousIfParticipant(participant);
+
 			kParticipant.unpublishMedia(reason, null);
 			session.cancelPublisher(participant, reason);
 

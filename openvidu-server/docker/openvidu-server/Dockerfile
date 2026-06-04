@@ -5,6 +5,7 @@ MAINTAINER info@openvidu.io
 RUN apt-get update && apt-get install -y \
   curl \
   wget \
+  ffmpeg \
   openjdk-11-jre \
   coturn \
   redis-tools \
