@@ -12,10 +12,15 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.kurento.client.ListenerSubscription;
+import org.kurento.client.MediaFlowState;
 import org.kurento.client.MediaPipeline;
 import org.kurento.client.MediaProfileSpecType;
 import org.kurento.client.MediaType;
@@ -50,6 +55,12 @@ public class EvidenceRecordingService {
 
 	private final Map<String, RecorderEndpoint> activeRecorders = new ConcurrentHashMap<>();
 	private final Map<String, ActiveEvidenceRecording> activeEvidenceRecordings = new ConcurrentHashMap<>();
+	private final Map<String, PendingEvidenceStart> pendingEvidenceStarts = new ConcurrentHashMap<>();
+	private final ExecutorService evidenceStartExecutor = Executors.newCachedThreadPool(runnable -> {
+		Thread thread = new Thread(runnable, "MafiaEvidenceStart");
+		thread.setDaemon(true);
+		return thread;
+	});
 
 	public synchronized String start(Session session, Participant participant) {
 		String connectionId = participant.getParticipantPublicId();
@@ -123,6 +134,7 @@ public class EvidenceRecordingService {
 	public synchronized String startForPlayer(Session session, Participant participant, int playerNumber) {
 		PlayerClientInfo info = parsePlayerClientInfo(participant);
 		long clientCreated = info != null ? info.created : 0;
+		cancelPendingEvidenceStart(session.getSessionId(), playerNumber);
 		String result = startContinuous(session, participant, playerNumber, clientCreated, true);
 		if (result == null) {
 			return "player-excluded";
@@ -131,15 +143,37 @@ public class EvidenceRecordingService {
 	}
 
 	public synchronized String stopPlayer(String sessionId, int playerNumber) {
+		cancelPendingEvidenceStart(sessionId, playerNumber);
 		return stopContinuous(sessionId, playerNumber);
 	}
 
-	public synchronized void startContinuousIfEligible(Session session, Participant participant) {
+	public void startContinuousOnAudioFlowIfEligible(Session session, Participant participant) {
 		PlayerClientInfo info = parsePlayerClientInfo(participant);
 		if (info == null || info.playerNumber > MAX_PLAYER_NUMBER) {
 			return;
 		}
-		startContinuous(session, participant, info.playerNumber, info.created, false);
+
+		KurentoParticipant kp = (KurentoParticipant) participant;
+		PublisherEndpoint publisher = kp.getPublisher();
+		if (publisher == null || publisher.getEndpoint() == null || publisher.getMediaOptions() == null
+				|| !publisher.getMediaOptions().hasAudio()) {
+			return;
+		}
+
+		String key = evidenceKey(session.getSessionId(), info.playerNumber);
+		PendingEvidenceStart pending = new PendingEvidenceStart(session, participant, publisher, key, info.playerNumber,
+				info.created, participant.getParticipantPublicId());
+		PendingEvidenceStart previous = pendingEvidenceStarts.put(key, pending);
+		if (previous != null) {
+			previous.dispose();
+		}
+
+		ListenerSubscription subscription = publisher.getEndpoint().addMediaFlowOutStateChangeListener(event -> {
+			if (event.getState() == MediaFlowState.FLOWING && event.getMediaType() == MediaType.AUDIO) {
+				evidenceStartExecutor.execute(() -> startPendingContinuous(pending, "audio-flow"));
+			}
+		});
+		pending.setSubscription(subscription);
 	}
 
 	public synchronized void stopContinuousIfParticipant(Participant participant) {
@@ -147,6 +181,7 @@ public class EvidenceRecordingService {
 		if (info == null || info.playerNumber > MAX_PLAYER_NUMBER) {
 			return;
 		}
+		cancelPendingEvidenceStart(participant.getSessionId(), info.playerNumber);
 		stopContinuous(participant.getSessionId(), info.playerNumber, info.created, participant.getParticipantPublicId());
 	}
 
@@ -239,7 +274,7 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private String startContinuous(Session session, Participant participant, int playerNumber, long clientCreated,
+	private synchronized String startContinuous(Session session, Participant participant, int playerNumber, long clientCreated,
 			boolean manual) {
 		if (playerNumber > MAX_PLAYER_NUMBER) {
 			return null;
@@ -302,7 +337,7 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private String rotateContinuousSegment(String sessionId, int playerNumber) {
+	private synchronized String rotateContinuousSegment(String sessionId, int playerNumber) {
 		String key = evidenceKey(sessionId, playerNumber);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
 
@@ -343,11 +378,11 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private String stopContinuous(String sessionId, int playerNumber) {
+	private synchronized String stopContinuous(String sessionId, int playerNumber) {
 		return stopContinuous(sessionId, playerNumber, null, null);
 	}
 
-	private String stopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId) {
+	private synchronized String stopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId) {
 		String key = evidenceKey(sessionId, playerNumber);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
 
@@ -380,6 +415,54 @@ public class EvidenceRecordingService {
 			log.error("MK evidence continuous STOP failed session={} playerNumber={} connectionId={}", sessionId,
 					playerNumber, active.connectionId, e);
 			return "error: " + e.getMessage();
+		}
+	}
+
+	private void startPendingContinuous(PendingEvidenceStart pending, String reason) {
+		if (!pending.markCompleted()) {
+			return;
+		}
+
+		PendingEvidenceStart current = pendingEvidenceStarts.get(pending.key);
+		if (current != pending) {
+			pending.dispose();
+			return;
+		}
+
+		pendingEvidenceStarts.remove(pending.key, pending);
+		pending.dispose();
+
+		PlayerClientInfo currentInfo = parsePlayerClientInfo(pending.participant);
+		if (currentInfo == null || currentInfo.playerNumber != pending.playerNumber
+				|| currentInfo.created != pending.clientCreated) {
+			log.info(
+					"MK evidence continuous START skipped obsolete media event session={} playerNumber={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+			return;
+		}
+
+		if (!pending.participant.isStreaming()) {
+			log.info(
+					"MK evidence continuous START skipped non-streaming participant session={} playerNumber={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+			return;
+		}
+
+		KurentoParticipant kp = (KurentoParticipant) pending.participant;
+		if (kp.getPublisher() != pending.publisher) {
+			log.info(
+					"MK evidence continuous START skipped replaced publisher session={} playerNumber={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+			return;
+		}
+
+		startContinuous(pending.session, pending.participant, pending.playerNumber, pending.clientCreated, false);
+	}
+
+	private void cancelPendingEvidenceStart(String sessionId, int playerNumber) {
+		PendingEvidenceStart pending = pendingEvidenceStarts.remove(evidenceKey(sessionId, playerNumber));
+		if (pending != null) {
+			pending.dispose();
 		}
 	}
 
@@ -581,6 +664,53 @@ public class EvidenceRecordingService {
 			this.playerNumber = playerNumber;
 			this.connectionId = connectionId;
 			this.clientCreated = clientCreated;
+		}
+	}
+
+	private static class PendingEvidenceStart {
+		Session session;
+		Participant participant;
+		PublisherEndpoint publisher;
+		String key;
+		int playerNumber;
+		long clientCreated;
+		String connectionId;
+		private final AtomicBoolean completed = new AtomicBoolean(false);
+		private volatile ListenerSubscription subscription;
+
+		PendingEvidenceStart(Session session, Participant participant, PublisherEndpoint publisher, String key,
+				int playerNumber, long clientCreated, String connectionId) {
+			this.session = session;
+			this.participant = participant;
+			this.publisher = publisher;
+			this.key = key;
+			this.playerNumber = playerNumber;
+			this.clientCreated = clientCreated;
+			this.connectionId = connectionId;
+		}
+
+		boolean markCompleted() {
+			return completed.compareAndSet(false, true);
+		}
+
+		void setSubscription(ListenerSubscription subscription) {
+			this.subscription = subscription;
+			if (completed.get()) {
+				dispose();
+			}
+		}
+
+		void dispose() {
+			completed.set(true);
+			ListenerSubscription currentSubscription = subscription;
+			subscription = null;
+			if (currentSubscription != null && publisher != null && publisher.getEndpoint() != null) {
+				try {
+					publisher.getEndpoint().removeMediaFlowOutStateChangeListener(currentSubscription);
+				} catch (Exception ignored) {
+					// Stale publishers can already be gone during reconnect/unpublish cleanup.
+				}
+			}
 		}
 	}
 

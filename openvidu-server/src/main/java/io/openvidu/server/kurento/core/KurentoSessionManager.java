@@ -499,7 +499,7 @@ public class KurentoSessionManager extends SessionManager {
 
 		participant.setPublishedAt(new Timestamp(System.currentTimeMillis()).getTime());
 		kSession.newPublisher(participant);
-		evidenceRecordingService.startContinuousIfEligible(kSession, participant);
+		evidenceRecordingService.startContinuousOnAudioFlowIfEligible(kSession, participant);
 
 		participants = kParticipant.getSession().getParticipants();
 
@@ -1241,6 +1241,7 @@ public class KurentoSessionManager extends SessionManager {
 		}
 		// Reconnect publisher
 		final KurentoMediaOptions kurentoOptions = (KurentoMediaOptions) kParticipant.getPublisher().getMediaOptions();
+		evidenceRecordingService.stopContinuousIfParticipant(kParticipant);
 		// 1) Disconnect broken PublisherEndpoint from its PassThrough
 		PublisherEndpoint publisher = kParticipant.getPublisher();
 		final PassThrough passThru = publisher.disconnectFromPassThrough();
@@ -1251,6 +1252,7 @@ public class KurentoSessionManager extends SessionManager {
 		kParticipant.resetPublisherEndpoint(kurentoOptions, passThru);
 		kParticipant.createPublishingEndpoint(kurentoOptions, streamId);
 		String sdpAnswer = kParticipant.publishToRoom(sdpOffer, kurentoOptions.doLoopback, true);
+		evidenceRecordingService.startContinuousOnAudioFlowIfEligible(kSession, kParticipant);
 		log.debug("SDP Answer for publishing reconnection PARTICIPANT {}: {}", kParticipant.getParticipantPublicId(),
 				sdpAnswer);
 		CDR.log(new WebrtcDebugEvent(kParticipant, streamId, WebrtcDebugEventIssuer.server,
