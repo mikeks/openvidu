@@ -7,10 +7,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,12 +22,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.kurento.client.ErrorEvent;
+import org.kurento.client.EventListener;
 import org.kurento.client.ListenerSubscription;
 import org.kurento.client.MediaFlowState;
 import org.kurento.client.MediaPipeline;
 import org.kurento.client.MediaProfileSpecType;
 import org.kurento.client.MediaType;
 import org.kurento.client.RecorderEndpoint;
+import org.kurento.client.StoppedEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.FileSystemResource;
@@ -52,12 +58,19 @@ public class EvidenceRecordingService {
 	private static final long MIN_CUT_DURATION_MS = 1000;
 	private static final long MIN_CUT_FILE_BYTES = 1024;
 	private static final int MAX_PLAYER_NUMBER = 99;
+	private static final long RECORDER_STOP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(15);
+	private static final File EVIDENCE_LOG_FILE = new File(BASE_PATH + "evidence-recording.log");
 
 	private final Map<String, RecorderEndpoint> activeRecorders = new ConcurrentHashMap<>();
 	private final Map<String, ActiveEvidenceRecording> activeEvidenceRecordings = new ConcurrentHashMap<>();
 	private final Map<String, PendingEvidenceStart> pendingEvidenceStarts = new ConcurrentHashMap<>();
 	private final ExecutorService evidenceStartExecutor = Executors.newCachedThreadPool(runnable -> {
 		Thread thread = new Thread(runnable, "MafiaEvidenceStart");
+		thread.setDaemon(true);
+		return thread;
+	});
+	private final ExecutorService evidenceStopExecutor = Executors.newCachedThreadPool(runnable -> {
+		Thread thread = new Thread(runnable, "MafiaEvidenceStop");
 		thread.setDaemon(true);
 		return thread;
 	});
@@ -176,13 +189,14 @@ public class EvidenceRecordingService {
 		pending.setSubscription(subscription);
 	}
 
-	public synchronized void stopContinuousIfParticipant(Participant participant) {
+	public void stopContinuousIfParticipant(Participant participant) {
 		PlayerClientInfo info = parsePlayerClientInfo(participant);
 		if (info == null || info.playerNumber > MAX_PLAYER_NUMBER) {
 			return;
 		}
 		cancelPendingEvidenceStart(participant.getSessionId(), info.playerNumber);
-		stopContinuous(participant.getSessionId(), info.playerNumber, info.created, participant.getParticipantPublicId());
+		scheduleStopContinuous(participant.getSessionId(), info.playerNumber, info.created,
+				participant.getParticipantPublicId(), "participant-stop");
 	}
 
 	public synchronized SnapshotResult buildSnapshot(String roomId, int playerNumber, long startEpoch, long stopEpoch) {
@@ -210,10 +224,8 @@ public class EvidenceRecordingService {
 				return SnapshotResult.retry("requested-range-is-still-recording",
 						retryAfterSeconds(stopMs - nowMs));
 			}
-			String rotateResult = rotateContinuousSegment(sessionId, playerNumber);
-			if (rotateResult != null && rotateResult.startsWith("error:")) {
-				return SnapshotResult.retry("requested-range-is-still-recording", RETRY_AFTER_FINALIZE_GRACE_SECONDS);
-			}
+			scheduleRotateContinuousSegment(sessionId, playerNumber);
+			return SnapshotResult.retry("requested-range-is-still-recording", RETRY_AFTER_FINALIZE_GRACE_SECONDS);
 		}
 
 		List<Segment> overlappingSegments = findOverlappingSegments(sessionId, playerNumber, playerDir, startMs, stopMs);
@@ -292,7 +304,11 @@ public class EvidenceRecordingService {
 						sessionId, playerNumber, connectionId, clientCreated, current.clientCreated);
 				return "obsolete-player-connection";
 			}
-			stopContinuous(sessionId, playerNumber);
+			activeEvidenceRecordings.remove(key);
+			long stopMs = System.currentTimeMillis();
+			File finalFile = new File(current.file.getParentFile(),
+					"segment_" + current.startMs + "_" + stopMs + ".webm");
+			stopRecorderAsync(current, finalFile, "replace-active", false);
 		}
 
 		if (!participant.isStreaming()) {
@@ -325,6 +341,8 @@ public class EvidenceRecordingService {
 					new ActiveEvidenceRecording(recorder, publisher, activeFile, startMs, sessionId, playerNumber, connectionId,
 							clientCreated));
 
+			logEvidence("STARTED manual=" + manual, activeEvidenceRecordings.get(key), activeFile);
+
 			log.info(
 					"MK evidence continuous START session={} playerNumber={} connectionId={} clientCreated={} file={} manual={}",
 					sessionId, playerNumber, connectionId, clientCreated, activeFile.getAbsolutePath(), manual);
@@ -337,9 +355,9 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private synchronized String rotateContinuousSegment(String sessionId, int playerNumber) {
+	private String rotateContinuousSegment(String sessionId, int playerNumber) {
 		String key = evidenceKey(sessionId, playerNumber);
-		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
+		ActiveEvidenceRecording active = activeEvidenceRecordings.remove(key);
 
 		if (active == null) {
 			return "not-recording-player";
@@ -348,41 +366,16 @@ public class EvidenceRecordingService {
 		long stopMs = System.currentTimeMillis();
 		File finalFile = new File(active.file.getParentFile(), "segment_" + active.startMs + "_" + stopMs + ".webm");
 
-		try {
-			active.recorder.stop();
-			active.recorder.release();
-			Files.move(active.file.toPath(), finalFile.toPath());
-
-			long newStartMs = System.currentTimeMillis();
-			File newActiveFile = new File(active.file.getParentFile(),
-					"active_" + newStartMs + "_" + sanitizeFilePart(active.connectionId) + ".webm");
-			RecorderEndpoint recorder = new RecorderEndpoint.Builder(active.publisher.getPipeline(),
-					"file://" + newActiveFile.getAbsolutePath()).withMediaProfile(MediaProfileSpecType.WEBM_AUDIO_ONLY)
-							.build();
-			active.publisher.connect(recorder, MediaType.AUDIO, false);
-			recorder.record();
-
-			activeEvidenceRecordings.put(key,
-					new ActiveEvidenceRecording(recorder, active.publisher, newActiveFile, newStartMs, sessionId,
-							playerNumber, active.connectionId, active.clientCreated));
-
-			log.info("MK evidence continuous ROLL session={} playerNumber={} connectionId={} file={} newFile={}",
-					sessionId, playerNumber, active.connectionId, finalFile.getAbsolutePath(),
-					newActiveFile.getAbsolutePath());
-
-			return finalFile.getAbsolutePath();
-		} catch (Exception e) {
-			log.error("MK evidence continuous ROLL failed session={} playerNumber={} connectionId={}", sessionId,
-					playerNumber, active.connectionId, e);
-			return "error: " + e.getMessage();
-		}
+		stopRecorderAsync(active, finalFile, "rotate", true);
+		return finalFile.getAbsolutePath();
 	}
 
 	private synchronized String stopContinuous(String sessionId, int playerNumber) {
-		return stopContinuous(sessionId, playerNumber, null, null);
+		return stopContinuous(sessionId, playerNumber, null, null, "manual-stop");
 	}
 
-	private synchronized String stopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId) {
+	private synchronized String stopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId,
+			String reason) {
 		String key = evidenceKey(sessionId, playerNumber);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
 
@@ -402,19 +395,134 @@ public class EvidenceRecordingService {
 		long stopMs = System.currentTimeMillis();
 		File finalFile = new File(active.file.getParentFile(), "segment_" + active.startMs + "_" + stopMs + ".webm");
 
+		stopRecorderAsync(active, finalFile, reason, false);
+		return finalFile.getAbsolutePath();
+	}
+
+	private void scheduleStopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId,
+			String reason) {
+		evidenceStopExecutor.execute(() -> stopContinuous(sessionId, playerNumber, clientCreated, connectionId, reason));
+	}
+
+	private void scheduleRotateContinuousSegment(String sessionId, int playerNumber) {
+		evidenceStopExecutor.execute(() -> rotateContinuousSegment(sessionId, playerNumber));
+	}
+
+	private void stopRecorderAsync(ActiveEvidenceRecording active, File finalFile, String reason, boolean restartAfterStop) {
+		evidenceStopExecutor.execute(() -> stopRecorder(active, finalFile, reason, restartAfterStop));
+	}
+
+	private void stopRecorder(ActiveEvidenceRecording active, File finalFile, String reason, boolean restartAfterStop) {
+		CountDownLatch stopped = new CountDownLatch(1);
+		AtomicBoolean finalized = new AtomicBoolean(false);
+		active.state = EvidenceRecordingState.STOPPING;
+
+		logEvidence("STOP_REQUEST reason=" + reason, active, finalFile);
+
 		try {
+			active.recorder.addErrorListener(new EventListener<ErrorEvent>() {
+				@Override
+				public void onEvent(ErrorEvent event) {
+					logEvidence("ERROR code=" + event.getErrorCode() + " description=" + event.getDescription(), active,
+							finalFile);
+				}
+			});
+
+			active.recorder.addStoppedListener(new EventListener<StoppedEvent>() {
+				@Override
+				public void onEvent(StoppedEvent event) {
+					if (finalized.compareAndSet(false, true)) {
+						finalizeStoppedRecorder(active, finalFile, reason, event.getTimestampMillis());
+						stopped.countDown();
+						if (restartAfterStop) {
+							startNextContinuousSegment(active);
+						}
+					}
+				}
+			});
+
 			active.recorder.stop();
-			active.recorder.release();
-			Files.move(active.file.toPath(), finalFile.toPath());
 
-			log.info("MK evidence continuous STOP session={} playerNumber={} connectionId={} file={}", sessionId,
-					playerNumber, active.connectionId, finalFile.getAbsolutePath());
-
-			return finalFile.getAbsolutePath();
+			if (!stopped.await(RECORDER_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+					&& finalized.compareAndSet(false, true)) {
+				logEvidence("STOP_TIMEOUT reason=" + reason, active, finalFile);
+				active.state = EvidenceRecordingState.FAILED;
+				releaseRecorder(active);
+				stopped.countDown();
+				if (restartAfterStop) {
+					startNextContinuousSegment(active);
+				}
+			}
 		} catch (Exception e) {
-			log.error("MK evidence continuous STOP failed session={} playerNumber={} connectionId={}", sessionId,
-					playerNumber, active.connectionId, e);
-			return "error: " + e.getMessage();
+			log.error("MK evidence continuous STOP failed session={} playerNumber={} connectionId={}", active.sessionId,
+					active.playerNumber, active.connectionId, e);
+			logEvidence("STOP_FAILED reason=" + reason + " error=" + e.getMessage(), active, finalFile);
+			active.state = EvidenceRecordingState.FAILED;
+			releaseRecorder(active);
+			if (restartAfterStop) {
+				startNextContinuousSegment(active);
+			}
+		}
+	}
+
+	private void finalizeStoppedRecorder(ActiveEvidenceRecording active, File finalFile, String reason,
+			String stoppedTimestamp) {
+		try {
+			releaseRecorder(active);
+			Files.move(active.file.toPath(), finalFile.toPath());
+			active.state = EvidenceRecordingState.STOPPED;
+
+			log.info("MK evidence continuous STOP session={} playerNumber={} connectionId={} file={}", active.sessionId,
+					active.playerNumber, active.connectionId, finalFile.getAbsolutePath());
+			logEvidence("STOPPED reason=" + reason + " stoppedTimestamp=" + stoppedTimestamp, active, finalFile);
+		} catch (Exception e) {
+			log.error("MK evidence continuous FINALIZE failed session={} playerNumber={} connectionId={}",
+					active.sessionId, active.playerNumber, active.connectionId, e);
+			logEvidence("FINALIZE_FAILED reason=" + reason + " error=" + e.getMessage(), active, finalFile);
+			active.state = EvidenceRecordingState.FAILED;
+		}
+	}
+
+	private void releaseRecorder(ActiveEvidenceRecording active) {
+		try {
+			active.recorder.release();
+			logEvidence("RELEASED", active, null);
+		} catch (Exception e) {
+			log.warn("MK evidence continuous RELEASE failed session={} playerNumber={} connectionId={}",
+					active.sessionId, active.playerNumber, active.connectionId, e);
+			logEvidence("RELEASE_FAILED error=" + e.getMessage(), active, null);
+		}
+	}
+
+	private void startNextContinuousSegment(ActiveEvidenceRecording previous) {
+		String key = evidenceKey(previous.sessionId, previous.playerNumber);
+		if (activeEvidenceRecordings.containsKey(key)) {
+			logEvidence("RESTART_SKIPPED existing-active", previous, null);
+			return;
+		}
+
+		long startMs = System.currentTimeMillis();
+		File activeFile = new File(previous.file.getParentFile(),
+				"active_" + startMs + "_" + sanitizeFilePart(previous.connectionId) + ".webm");
+
+		try {
+			RecorderEndpoint recorder = new RecorderEndpoint.Builder(previous.publisher.getPipeline(),
+					"file://" + activeFile.getAbsolutePath()).withMediaProfile(MediaProfileSpecType.WEBM_AUDIO_ONLY)
+							.build();
+			previous.publisher.connect(recorder, MediaType.AUDIO, false);
+			recorder.record();
+
+			ActiveEvidenceRecording next = new ActiveEvidenceRecording(recorder, previous.publisher, activeFile, startMs,
+					previous.sessionId, previous.playerNumber, previous.connectionId, previous.clientCreated);
+			activeEvidenceRecordings.put(key, next);
+
+			log.info("MK evidence continuous RESTART session={} playerNumber={} connectionId={} file={}",
+					previous.sessionId, previous.playerNumber, previous.connectionId, activeFile.getAbsolutePath());
+			logEvidence("RESTARTED", next, activeFile);
+		} catch (Exception e) {
+			log.error("MK evidence continuous RESTART failed session={} playerNumber={} connectionId={}",
+					previous.sessionId, previous.playerNumber, previous.connectionId, e);
+			logEvidence("RESTART_FAILED error=" + e.getMessage(), previous, activeFile);
 		}
 	}
 
@@ -644,6 +752,36 @@ public class EvidenceRecordingService {
 		}
 	}
 
+	private void logEvidence(String action, ActiveEvidenceRecording active, File file) {
+		String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS").format(new Date())
+				+ " action=\"" + action + "\""
+				+ " state=" + (active != null ? active.state : "null")
+				+ " session=" + (active != null ? active.sessionId : "null")
+				+ " player=" + (active != null ? active.playerNumber : 0)
+				+ " connection=" + (active != null ? active.connectionId : "null")
+				+ " clientCreated=" + (active != null ? active.clientCreated : 0)
+				+ " activeFile=\"" + (active != null && active.file != null ? active.file.getAbsolutePath() : "") + "\""
+				+ " file=\"" + (file != null ? file.getAbsolutePath() : "") + "\"";
+		synchronized (EVIDENCE_LOG_FILE) {
+			try {
+				EVIDENCE_LOG_FILE.getParentFile().mkdirs();
+				try (BufferedWriter writer = new BufferedWriter(new FileWriter(EVIDENCE_LOG_FILE, true))) {
+					writer.write(line);
+					writer.newLine();
+				}
+			} catch (IOException e) {
+				log.warn("MK evidence failed to write evidence log", e);
+			}
+		}
+	}
+
+	private enum EvidenceRecordingState {
+		RECORDING,
+		STOPPING,
+		STOPPED,
+		FAILED
+	}
+
 	private static class ActiveEvidenceRecording {
 		RecorderEndpoint recorder;
 		PublisherEndpoint publisher;
@@ -653,6 +791,7 @@ public class EvidenceRecordingService {
 		int playerNumber;
 		String connectionId;
 		long clientCreated;
+		volatile EvidenceRecordingState state = EvidenceRecordingState.RECORDING;
 
 		ActiveEvidenceRecording(RecorderEndpoint recorder, PublisherEndpoint publisher, File file, long startMs,
 				String sessionId, int playerNumber, String connectionId, long clientCreated) {
