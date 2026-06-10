@@ -18,12 +18,17 @@
 package io.openvidu.server.kurento.core;
 
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.function.Function;
 
@@ -63,6 +68,12 @@ import io.openvidu.server.utils.RemoteOperationUtils;
 public class KurentoParticipant extends Participant {
 
 	private static final Logger log = LoggerFactory.getLogger(KurentoParticipant.class);
+	private static final ScheduledExecutorService MEDIA_ELEMENT_RELEASE_WATCHDOG = Executors
+			.newSingleThreadScheduledExecutor(r -> {
+				Thread t = new Thread(r, "media-element-release-watchdog");
+				t.setDaemon(true);
+				return t;
+			});
 
 	private OpenviduConfig openviduConfig;
 	private RecordingManager recordingManager;
@@ -155,6 +166,10 @@ public class KurentoParticipant extends Participant {
 
 	public SubscriberEndpoint getSubscriber(String senderPublicId) {
 		return this.subscribers.get(senderPublicId);
+	}
+
+	public Set<String> getSubscriberSenderPublicIds() {
+		return new HashSet<>(this.subscribers.keySet());
 	}
 
 	public Collection<SubscriberEndpoint> getSubscribers() {
@@ -319,6 +334,14 @@ public class KurentoParticipant extends Participant {
 	public void cancelReceivingMedia(KurentoParticipant senderKurentoParticipant, EndReason reason, boolean silent) {
 		final String senderName = senderKurentoParticipant.getParticipantPublicId();
 		final PublisherEndpoint pub = senderKurentoParticipant.publisher;
+		SubscriberEndpoint subscriberEndpoint = subscribers.remove(senderName);
+		if (subscriberEndpoint == null) {
+			log.warn(
+					"PARTICIPANT {}: Trying to cancel receiving video from user {}. "
+							+ "But there is no such subscriber endpoint.",
+					this.getParticipantPublicId(), senderName);
+			return;
+		}
 		if (pub != null) {
 			try {
 				final Lock closingWriteLock = pub.closingLock.writeLock();
@@ -326,18 +349,10 @@ public class KurentoParticipant extends Participant {
 					try {
 						log.info("PARTICIPANT {}: cancel receiving media from {}", this.getParticipantPublicId(),
 								senderName);
-						SubscriberEndpoint subscriberEndpoint = subscribers.remove(senderName);
-						if (subscriberEndpoint == null) {
-							log.warn(
-									"PARTICIPANT {}: Trying to cancel receiving video from user {}. "
-											+ "But there is no such subscriber endpoint.",
-									this.getParticipantPublicId(), senderName);
-						} else {
-							releaseSubscriberEndpoint(senderName, senderKurentoParticipant, subscriberEndpoint, reason,
-									silent);
-							log.info("PARTICIPANT {}: stopped receiving media from {} in room {}",
-									this.getParticipantPublicId(), senderName, this.session.getSessionId());
-						}
+						releaseSubscriberEndpoint(senderName, senderKurentoParticipant, subscriberEndpoint, reason,
+								silent);
+						log.info("PARTICIPANT {}: stopped receiving media from {} in room {}",
+								this.getParticipantPublicId(), senderName, this.session.getSessionId());
 					} finally {
 						closingWriteLock.unlock();
 					}
@@ -345,16 +360,32 @@ public class KurentoParticipant extends Participant {
 					log.error(
 							"Timeout waiting for PublisherEndpoint closing lock of participant {} to be available for participant {} to call cancelReceivingMedia",
 							senderName, this.getParticipantPublicId());
+					releaseSubscriberEndpoint(senderName, senderKurentoParticipant, subscriberEndpoint, reason, silent);
 				}
 			} catch (InterruptedException e) {
 				log.error(
 						"InterruptedException while waiting for PublisherEndpoint closing lock of participant {} to be available for participant {} to call cancelReceivingMedia",
 						senderName, this.getParticipantPublicId());
-			} finally {
-				// Always clean map
-				subscribers.remove(senderName);
+				releaseSubscriberEndpoint(senderName, senderKurentoParticipant, subscriberEndpoint, reason, silent);
 			}
+		} else {
+			log.warn(
+					"PARTICIPANT {}: PublisherEndpoint of participant {} is null while cancelling receiving media. Releasing subscriber endpoint anyway",
+					this.getParticipantPublicId(), senderName);
+			releaseSubscriberEndpoint(senderName, senderKurentoParticipant, subscriberEndpoint, reason, silent);
 		}
+	}
+
+	public boolean cleanupStaleSubscriberEndpoint(String senderName, EndReason reason) {
+		SubscriberEndpoint subscriberEndpoint = subscribers.remove(senderName);
+		if (subscriberEndpoint == null) {
+			return false;
+		}
+
+		log.warn("PARTICIPANT {}: cleaning stale subscriber endpoint from {} in room {}",
+				this.getParticipantPublicId(), senderName, this.session.getSessionId());
+		releaseSubscriberEndpoint(senderName, null, subscriberEndpoint, reason, true);
+		return true;
 	}
 
 	public void close(EndReason reason, boolean definitelyClosed, Long kmsDisconnectionTime) {
@@ -605,25 +636,59 @@ public class KurentoParticipant extends Participant {
 
 	void releaseElement(final String senderName, final MediaElement element) {
 		final String eid = element.getId();
+		log.debug("PARTICIPANT {}: Releasing media element #{} for {}", getParticipantPublicId(), eid, senderName);
 		try {
 			if (!RemoteOperationUtils.mustSkipRemoteOperation()) {
+				final AtomicBoolean releaseCompleted = new AtomicBoolean(false);
 				element.release(new Continuation<Void>() {
 					@Override
 					public void onSuccess(Void result) throws Exception {
-						log.debug("PARTICIPANT {}: Released successfully media element #{} for {}",
+						releaseCompleted.set(true);
+						log.info("PARTICIPANT {}: Released successfully media element #{} for {}",
 								getParticipantPublicId(), eid, senderName);
 					}
 
 					@Override
 					public void onError(Throwable cause) throws Exception {
+						releaseCompleted.set(true);
 						log.warn("PARTICIPANT {}: Could not release media element #{} for {}", getParticipantPublicId(),
 								eid, senderName, cause);
+						retryReleaseElement(senderName, element, eid, "after error");
 					}
 				});
+				MEDIA_ELEMENT_RELEASE_WATCHDOG.schedule(() -> {
+					if (releaseCompleted.compareAndSet(false, true)) {
+						log.error("PARTICIPANT {}: Media element #{} for {} release did not complete in 10 seconds",
+								getParticipantPublicId(), eid, senderName);
+						retryReleaseElement(senderName, element, eid, "after timeout");
+					}
+				}, 10, TimeUnit.SECONDS);
 			}
 		} catch (Exception e) {
 			log.error("PARTICIPANT {}: Error calling release on elem #{} for {}", getParticipantPublicId(), eid,
 					senderName, e);
+		}
+	}
+
+	private void retryReleaseElement(final String senderName, final MediaElement element, final String eid,
+			final String reason) {
+		try {
+			element.release(new Continuation<Void>() {
+				@Override
+				public void onSuccess(Void result) throws Exception {
+					log.info("PARTICIPANT {}: Released successfully media element #{} for {} on retry {}",
+							getParticipantPublicId(), eid, senderName, reason);
+				}
+
+				@Override
+				public void onError(Throwable retryCause) throws Exception {
+					log.error("PARTICIPANT {}: Could not release media element #{} for {} on retry {}",
+							getParticipantPublicId(), eid, senderName, reason, retryCause);
+				}
+			});
+		} catch (Exception retryException) {
+			log.error("PARTICIPANT {}: Error calling release retry on elem #{} for {} {}",
+					getParticipantPublicId(), eid, senderName, reason, retryException);
 		}
 	}
 

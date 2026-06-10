@@ -27,10 +27,14 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 
 import org.apache.commons.lang3.RandomStringUtils;
@@ -87,6 +91,16 @@ import io.openvidu.server.utils.SDPMunging;
 public class KurentoSessionManager extends SessionManager {
 
 	private static final Logger log = LoggerFactory.getLogger(KurentoSessionManager.class);
+	private static final long STALE_SUBSCRIBER_CLEANUP_INTERVAL_MS = TimeUnit.SECONDS.toMillis(15);
+	private static final long STALE_SUBSCRIBER_MIN_AGE_MS = TimeUnit.MINUTES.toMillis(2);
+
+	private final ConcurrentHashMap<String, Long> staleSubscriberFirstObservedMs = new ConcurrentHashMap<>();
+	private final ScheduledExecutorService staleSubscriberCleanupExecutor = Executors
+			.newSingleThreadScheduledExecutor(runnable -> {
+				Thread thread = new Thread(runnable, "stale-subscriber-cleanup");
+				thread.setDaemon(true);
+				return thread;
+			});
 
 	@Autowired
 	protected KmsManager kmsManager;
@@ -1401,6 +1415,99 @@ public class KurentoSessionManager extends SessionManager {
 		}
 	}
 
+	@PostConstruct
+	private void startStaleSubscriberCleanup() {
+		this.staleSubscriberCleanupExecutor.scheduleWithFixedDelay(this::cleanupStaleSubscriberRefsSafely,
+				STALE_SUBSCRIBER_CLEANUP_INTERVAL_MS, STALE_SUBSCRIBER_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+		log.info("Stale subscriber cleanup initialized. Running every {} ms and cleaning refs stale for at least {} ms",
+				STALE_SUBSCRIBER_CLEANUP_INTERVAL_MS, STALE_SUBSCRIBER_MIN_AGE_MS);
+	}
+
+	private void cleanupStaleSubscriberRefsSafely() {
+		try {
+			cleanupStaleSubscriberRefs();
+		} catch (Exception e) {
+			log.warn("Error running stale subscriber cleanup", e);
+		}
+	}
+
+	private void cleanupStaleSubscriberRefs() {
+		long nowMs = System.currentTimeMillis();
+		Set<String> observedThisSweep = ConcurrentHashMap.newKeySet();
+		int staleCandidates = 0;
+		int cleaned = 0;
+
+		for (Session activeSession : this.sessions.values()) {
+			if (!(activeSession instanceof KurentoSession) || activeSession.isClosed()) {
+				continue;
+			}
+
+			KurentoSession session = (KurentoSession) activeSession;
+			Set<Participant> participants = session.getParticipants();
+			Set<String> streamingParticipantIds = new HashSet<>();
+
+			for (Participant participant : participants) {
+				if (!participant.isClosed() && participant.isStreaming()) {
+					streamingParticipantIds.add(participant.getParticipantPublicId());
+				}
+			}
+
+			for (Participant participant : participants) {
+				if (!(participant instanceof KurentoParticipant) || participant.isClosed()) {
+					continue;
+				}
+
+				KurentoParticipant subscriber = (KurentoParticipant) participant;
+				for (String senderPublicId : subscriber.getSubscriberSenderPublicIds()) {
+					String staleKey = staleSubscriberKey(session.getSessionId(), subscriber.getParticipantPublicId(),
+							senderPublicId);
+					if (streamingParticipantIds.contains(senderPublicId)) {
+						this.staleSubscriberFirstObservedMs.remove(staleKey);
+						continue;
+					}
+
+					observedThisSweep.add(staleKey);
+					staleCandidates++;
+					Long firstObserved = this.staleSubscriberFirstObservedMs.putIfAbsent(staleKey, nowMs);
+					if (firstObserved == null) {
+						log.warn("Stale subscriber candidate observed session={} subscriber={} sender={}",
+								session.getSessionId(), subscriber.getParticipantPublicId(), senderPublicId);
+						continue;
+					}
+
+					long ageMs = nowMs - firstObserved.longValue();
+					if (ageMs < STALE_SUBSCRIBER_MIN_AGE_MS) {
+						continue;
+					}
+
+					Participant sender = session.getParticipantByPublicId(senderPublicId);
+					if (sender != null && !sender.isClosed() && sender.isStreaming()) {
+						this.staleSubscriberFirstObservedMs.remove(staleKey);
+						continue;
+					}
+
+					if (subscriber.cleanupStaleSubscriberEndpoint(senderPublicId, EndReason.networkDisconnect)) {
+						cleaned++;
+						this.staleSubscriberFirstObservedMs.remove(staleKey);
+						log.warn("Stale subscriber cleaned session={} subscriber={} sender={} ageMs={}",
+								session.getSessionId(), subscriber.getParticipantPublicId(), senderPublicId, ageMs);
+					}
+				}
+			}
+		}
+
+		this.staleSubscriberFirstObservedMs.keySet().removeIf(key -> !observedThisSweep.contains(key));
+
+		if (staleCandidates > 0 || cleaned > 0) {
+			log.warn("Stale subscriber cleanup sweep candidates={} cleaned={} tracked={}", staleCandidates, cleaned,
+					this.staleSubscriberFirstObservedMs.size());
+		}
+	}
+
+	private String staleSubscriberKey(String sessionId, String subscriberPublicId, String senderPublicId) {
+		return sessionId + "|" + subscriberPublicId + "|" + senderPublicId;
+	}
+
 	protected Kms selectMediaNode(Session session) throws OpenViduException {
 		Kms lessLoadedKms = null;
 		try {
@@ -1419,6 +1526,8 @@ public class KurentoSessionManager extends SessionManager {
 	@PreDestroy
 	@Override
 	public void close() {
+		this.staleSubscriberCleanupExecutor.shutdownNow();
+		this.staleSubscriberFirstObservedMs.clear();
 		super.close();
 		this.kmsManager.closeAllKurentoClients();
 	}

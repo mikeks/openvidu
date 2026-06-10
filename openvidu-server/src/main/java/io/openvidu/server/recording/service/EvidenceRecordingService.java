@@ -13,12 +13,18 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -59,21 +65,20 @@ public class EvidenceRecordingService {
 	private static final long MIN_CUT_FILE_BYTES = 1024;
 	private static final int MAX_PLAYER_NUMBER = 99;
 	private static final long RECORDER_STOP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(15);
+	private static final long RECORDER_STOP_DELAY_MS = TimeUnit.SECONDS.toMillis(30);
+	private static final long EVIDENCE_KMS_BACKOFF_MS = TimeUnit.MINUTES.toMillis(1);
+	private static final int EVIDENCE_QUEUE_CAPACITY = 100;
 	private static final File EVIDENCE_LOG_FILE = new File(BASE_PATH + "evidence-recording.log");
 
 	private final Map<String, RecorderEndpoint> activeRecorders = new ConcurrentHashMap<>();
 	private final Map<String, ActiveEvidenceRecording> activeEvidenceRecordings = new ConcurrentHashMap<>();
 	private final Map<String, PendingEvidenceStart> pendingEvidenceStarts = new ConcurrentHashMap<>();
-	private final ExecutorService evidenceStartExecutor = Executors.newCachedThreadPool(runnable -> {
-		Thread thread = new Thread(runnable, "MafiaEvidenceStart");
-		thread.setDaemon(true);
-		return thread;
-	});
-	private final ExecutorService evidenceStopExecutor = Executors.newCachedThreadPool(runnable -> {
-		Thread thread = new Thread(runnable, "MafiaEvidenceStop");
-		thread.setDaemon(true);
-		return thread;
-	});
+	private final AtomicLong evidenceDisabledUntilMs = new AtomicLong(0);
+	private final ExecutorService evidenceKurentoExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+			new ArrayBlockingQueue<>(EVIDENCE_QUEUE_CAPACITY), runnable -> newDaemonThread(runnable, "MafiaEvidenceKms"),
+			new ThreadPoolExecutor.AbortPolicy());
+	private final ScheduledExecutorService evidenceStopScheduler = Executors
+			.newSingleThreadScheduledExecutor(runnable -> newDaemonThread(runnable, "MafiaEvidenceStopDelay"));
 
 	public synchronized String start(Session session, Participant participant) {
 		String connectionId = participant.getParticipantPublicId();
@@ -183,7 +188,8 @@ public class EvidenceRecordingService {
 
 		ListenerSubscription subscription = publisher.getEndpoint().addMediaFlowOutStateChangeListener(event -> {
 			if (event.getState() == MediaFlowState.FLOWING && event.getMediaType() == MediaType.AUDIO) {
-				evidenceStartExecutor.execute(() -> startPendingContinuous(pending, "audio-flow"));
+				executeEvidenceKurentoTask(() -> startPendingContinuous(pending, "audio-flow"),
+						"start " + session.getSessionId() + " player " + info.playerNumber);
 			}
 		});
 		pending.setSubscription(subscription);
@@ -291,6 +297,9 @@ public class EvidenceRecordingService {
 		if (playerNumber > MAX_PLAYER_NUMBER) {
 			return null;
 		}
+		if (isEvidenceBackoffActive()) {
+			return "evidence-backoff";
+		}
 
 		String sessionId = session.getSessionId();
 		String connectionId = participant.getParticipantPublicId();
@@ -304,11 +313,12 @@ public class EvidenceRecordingService {
 						sessionId, playerNumber, connectionId, clientCreated, current.clientCreated);
 				return "obsolete-player-connection";
 			}
+			cancelDelayedStop(current, "replace-active");
 			activeEvidenceRecordings.remove(key);
 			long stopMs = System.currentTimeMillis();
 			File finalFile = new File(current.file.getParentFile(),
 					"segment_" + current.startMs + "_" + stopMs + ".webm");
-			stopRecorderAsync(current, finalFile, "replace-active", false);
+			stopRecorderDelayed(current, finalFile, "replace-active", false);
 		}
 
 		if (!participant.isStreaming()) {
@@ -327,15 +337,24 @@ public class EvidenceRecordingService {
 		dir.mkdirs();
 
 		File activeFile = new File(dir, "active_" + startMs + "_" + sanitizeFilePart(connectionId) + ".webm");
+		ActiveEvidenceRecording pendingLog = new ActiveEvidenceRecording(null, publisher, activeFile, startMs, sessionId,
+				playerNumber, connectionId, clientCreated);
 
 		try {
+			logEvidence("START_BEGIN manual=" + manual, pendingLog, activeFile);
 			MediaPipeline pipeline = publisher.getPipeline();
 
 			RecorderEndpoint recorder = new RecorderEndpoint.Builder(pipeline, "file://" + activeFile.getAbsolutePath())
 					.withMediaProfile(MediaProfileSpecType.WEBM_AUDIO_ONLY).build();
 
+			long connectStartMs = System.currentTimeMillis();
 			publisher.connect(recorder, MediaType.AUDIO, false);
+			logEvidence("START_CONNECTED durationMs=" + (System.currentTimeMillis() - connectStartMs), pendingLog,
+					activeFile);
+			long recordStartMs = System.currentTimeMillis();
 			recorder.record();
+			logEvidence("START_RECORDING durationMs=" + (System.currentTimeMillis() - recordStartMs), pendingLog,
+					activeFile);
 
 			activeEvidenceRecordings.put(key,
 					new ActiveEvidenceRecording(recorder, publisher, activeFile, startMs, sessionId, playerNumber, connectionId,
@@ -351,6 +370,7 @@ public class EvidenceRecordingService {
 		} catch (Exception e) {
 			log.error("MK evidence continuous START failed session={} playerNumber={} connectionId={}", sessionId,
 					playerNumber, connectionId, e);
+			markEvidenceBackoffIfKurentoTransportFailure(e);
 			return "error: " + e.getMessage();
 		}
 	}
@@ -391,6 +411,7 @@ public class EvidenceRecordingService {
 		}
 
 		activeEvidenceRecordings.remove(key);
+		cancelDelayedStop(active, reason);
 
 		long stopMs = System.currentTimeMillis();
 		File finalFile = new File(active.file.getParentFile(), "segment_" + active.startMs + "_" + stopMs + ".webm");
@@ -401,20 +422,84 @@ public class EvidenceRecordingService {
 
 	private void scheduleStopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId,
 			String reason) {
-		evidenceStopExecutor.execute(() -> stopContinuous(sessionId, playerNumber, clientCreated, connectionId, reason));
+		executeEvidenceKurentoTask(() -> scheduleStopContinuousDelayed(sessionId, playerNumber, clientCreated, connectionId, reason),
+				"stop " + sessionId + " player " + playerNumber);
 	}
 
 	private void scheduleRotateContinuousSegment(String sessionId, int playerNumber) {
-		evidenceStopExecutor.execute(() -> rotateContinuousSegment(sessionId, playerNumber));
+		executeEvidenceKurentoTask(() -> rotateContinuousSegment(sessionId, playerNumber),
+				"rotate " + sessionId + " player " + playerNumber);
 	}
 
 	private void stopRecorderAsync(ActiveEvidenceRecording active, File finalFile, String reason, boolean restartAfterStop) {
-		evidenceStopExecutor.execute(() -> stopRecorder(active, finalFile, reason, restartAfterStop));
+		executeEvidenceKurentoTask(() -> stopRecorder(active, finalFile, reason, restartAfterStop),
+				"stop-recorder " + active.sessionId + " player " + active.playerNumber + " reason " + reason);
+	}
+
+	private synchronized String scheduleStopContinuousDelayed(String sessionId, int playerNumber, Long clientCreated,
+			String connectionId, String reason) {
+		String key = evidenceKey(sessionId, playerNumber);
+		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
+
+		if (active == null) {
+			return "not-recording-player";
+		}
+
+		if (clientCreated != null && active.clientCreated != clientCreated.longValue()) {
+			log.info(
+					"MK evidence continuous ignoring obsolete delayed stop session={} playerNumber={} connectionId={} clientCreated={} activeConnectionId={} activeClientCreated={}",
+					sessionId, playerNumber, connectionId, clientCreated, active.connectionId, active.clientCreated);
+			return "obsolete-player-connection";
+		}
+
+		cancelDelayedStop(active, "reschedule-" + reason);
+		long stopMs = System.currentTimeMillis();
+		File finalFile = new File(active.file.getParentFile(), "segment_" + active.startMs + "_" + stopMs + ".webm");
+		stopRecorderDelayed(active, finalFile, reason, false);
+		return finalFile.getAbsolutePath();
+	}
+
+	private void stopRecorderDelayed(ActiveEvidenceRecording active, File finalFile, String reason,
+			boolean restartAfterStop) {
+		active.state = EvidenceRecordingState.STOP_PENDING;
+		logEvidence("STOP_DELAYED reason=" + reason + " delayMs=" + RECORDER_STOP_DELAY_MS + " restartAfterStop="
+				+ restartAfterStop, active, finalFile);
+
+		ScheduledFuture<?> future = evidenceStopScheduler.schedule(() -> {
+			synchronized (EvidenceRecordingService.this) {
+				if (active.pendingStopFuture == null) {
+					logEvidence("STOP_DELAY_CANCELLED_BEFORE_FIRE reason=" + reason, active, finalFile);
+					return;
+				}
+				active.pendingStopFuture = null;
+				activeEvidenceRecordings.remove(evidenceKey(active.sessionId, active.playerNumber), active);
+			}
+
+			logEvidence("STOP_DELAY_FIRED reason=" + reason, active, finalFile);
+			stopRecorderAsync(active, finalFile, reason, restartAfterStop);
+		}, RECORDER_STOP_DELAY_MS, TimeUnit.MILLISECONDS);
+
+		synchronized (this) {
+			active.pendingStopFuture = future;
+		}
+	}
+
+	private void cancelDelayedStop(ActiveEvidenceRecording active, String reason) {
+		ScheduledFuture<?> future = active.pendingStopFuture;
+		if (future == null) {
+			return;
+		}
+
+		active.pendingStopFuture = null;
+		boolean cancelled = future.cancel(false);
+		active.state = EvidenceRecordingState.RECORDING;
+		logEvidence("STOP_DELAY_CANCELLED reason=" + reason + " cancelled=" + cancelled, active, null);
 	}
 
 	private void stopRecorder(ActiveEvidenceRecording active, File finalFile, String reason, boolean restartAfterStop) {
 		CountDownLatch stopped = new CountDownLatch(1);
 		AtomicBoolean finalized = new AtomicBoolean(false);
+		AtomicReference<String> stoppedTimestamp = new AtomicReference<>("");
 		active.state = EvidenceRecordingState.STOPPING;
 
 		logEvidence("STOP_REQUEST reason=" + reason, active, finalFile);
@@ -428,26 +513,29 @@ public class EvidenceRecordingService {
 				}
 			});
 
-			active.recorder.addStoppedListener(new EventListener<StoppedEvent>() {
-				@Override
-				public void onEvent(StoppedEvent event) {
-					if (finalized.compareAndSet(false, true)) {
-						finalizeStoppedRecorder(active, finalFile, reason, event.getTimestampMillis());
-						stopped.countDown();
-						if (restartAfterStop) {
-							startNextContinuousSegment(active);
+				active.recorder.addStoppedListener(new EventListener<StoppedEvent>() {
+					@Override
+					public void onEvent(StoppedEvent event) {
+						if (finalized.compareAndSet(false, true)) {
+							stoppedTimestamp.set(event.getTimestampMillis());
+							stopped.countDown();
 						}
-					}
 				}
 			});
 
+			long stopStartMs = System.currentTimeMillis();
 			active.recorder.stop();
+			logEvidence("STOP_RETURNED reason=" + reason + " durationMs=" + (System.currentTimeMillis() - stopStartMs),
+					active, finalFile);
 
-			if (!stopped.await(RECORDER_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-					&& finalized.compareAndSet(false, true)) {
+			if (stopped.await(RECORDER_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+				finalizeStoppedRecorder(active, finalFile, reason, stoppedTimestamp.get());
+				if (restartAfterStop) {
+					startNextContinuousSegment(active);
+				}
+			} else if (finalized.compareAndSet(false, true)) {
 				logEvidence("STOP_TIMEOUT reason=" + reason, active, finalFile);
 				active.state = EvidenceRecordingState.FAILED;
-				releaseRecorder(active);
 				stopped.countDown();
 				if (restartAfterStop) {
 					startNextContinuousSegment(active);
@@ -457,8 +545,20 @@ public class EvidenceRecordingService {
 			log.error("MK evidence continuous STOP failed session={} playerNumber={} connectionId={}", active.sessionId,
 					active.playerNumber, active.connectionId, e);
 			logEvidence("STOP_FAILED reason=" + reason + " error=" + e.getMessage(), active, finalFile);
+			if (isKurentoMediaObjectNotFound(e)) {
+				logEvidence("STOP_ALREADY_GONE reason=" + reason, active, finalFile);
+				finalizeStoppedRecorder(active, finalFile, reason, "media-object-not-found");
+				if (restartAfterStop) {
+					startNextContinuousSegment(active);
+				}
+				return;
+			}
 			active.state = EvidenceRecordingState.FAILED;
-			releaseRecorder(active);
+			if (markEvidenceBackoffIfKurentoTransportFailure(e)) {
+				logEvidence("RELEASE_SKIPPED transport-failure", active, null);
+			} else {
+				releaseRecorder(active);
+			}
 			if (restartAfterStop) {
 				startNextContinuousSegment(active);
 			}
@@ -469,7 +569,9 @@ public class EvidenceRecordingService {
 			String stoppedTimestamp) {
 		try {
 			releaseRecorder(active);
+			long moveStartMs = System.currentTimeMillis();
 			Files.move(active.file.toPath(), finalFile.toPath());
+			logEvidence("FILE_MOVED durationMs=" + (System.currentTimeMillis() - moveStartMs), active, finalFile);
 			active.state = EvidenceRecordingState.STOPPED;
 
 			log.info("MK evidence continuous STOP session={} playerNumber={} connectionId={} file={}", active.sessionId,
@@ -485,12 +587,15 @@ public class EvidenceRecordingService {
 
 	private void releaseRecorder(ActiveEvidenceRecording active) {
 		try {
+			long releaseStartMs = System.currentTimeMillis();
+			logEvidence("RELEASE_BEGIN", active, null);
 			active.recorder.release();
-			logEvidence("RELEASED", active, null);
+			logEvidence("RELEASED durationMs=" + (System.currentTimeMillis() - releaseStartMs), active, null);
 		} catch (Exception e) {
 			log.warn("MK evidence continuous RELEASE failed session={} playerNumber={} connectionId={}",
 					active.sessionId, active.playerNumber, active.connectionId, e);
 			logEvidence("RELEASE_FAILED error=" + e.getMessage(), active, null);
+			markEvidenceBackoffIfKurentoTransportFailure(e);
 		}
 	}
 
@@ -506,6 +611,10 @@ public class EvidenceRecordingService {
 				"active_" + startMs + "_" + sanitizeFilePart(previous.connectionId) + ".webm");
 
 		try {
+			if (isEvidenceBackoffActive()) {
+				logEvidence("RESTART_SKIPPED evidence-backoff", previous, activeFile);
+				return;
+			}
 			RecorderEndpoint recorder = new RecorderEndpoint.Builder(previous.publisher.getPipeline(),
 					"file://" + activeFile.getAbsolutePath()).withMediaProfile(MediaProfileSpecType.WEBM_AUDIO_ONLY)
 							.build();
@@ -523,6 +632,7 @@ public class EvidenceRecordingService {
 			log.error("MK evidence continuous RESTART failed session={} playerNumber={} connectionId={}",
 					previous.sessionId, previous.playerNumber, previous.connectionId, e);
 			logEvidence("RESTART_FAILED error=" + e.getMessage(), previous, activeFile);
+			markEvidenceBackoffIfKurentoTransportFailure(e);
 		}
 	}
 
@@ -775,8 +885,63 @@ public class EvidenceRecordingService {
 		}
 	}
 
+	private static Thread newDaemonThread(Runnable runnable, String name) {
+		Thread thread = new Thread(runnable, name);
+		thread.setDaemon(true);
+		return thread;
+	}
+
+	private boolean isEvidenceBackoffActive() {
+		return System.currentTimeMillis() < evidenceDisabledUntilMs.get();
+	}
+
+	private boolean markEvidenceBackoffIfKurentoTransportFailure(Throwable e) {
+		if (!isKurentoTransportFailure(e)) {
+			return false;
+		}
+		long until = System.currentTimeMillis() + EVIDENCE_KMS_BACKOFF_MS;
+		evidenceDisabledUntilMs.updateAndGet(current -> Math.max(current, until));
+		log.warn("MK evidence temporary backoff until={} due to Kurento transport failure", until);
+		return true;
+	}
+
+	private boolean isKurentoTransportFailure(Throwable e) {
+		for (Throwable current = e; current != null; current = current.getCause()) {
+			String message = current.getMessage();
+			if (message == null) {
+				continue;
+			}
+			if (message.contains("Timeout trying to connect to websocket server")
+					|| message.contains("Connection with server have been closed")
+					|| message.contains("Timeout waiting")
+					|| message.contains("waiting from response to request")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean isKurentoMediaObjectNotFound(Throwable e) {
+		for (Throwable current = e; current != null; current = current.getCause()) {
+			String message = current.getMessage();
+			if (message != null && message.contains("MEDIA_OBJECT_NOT_FOUND")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private void executeEvidenceKurentoTask(Runnable task, String description) {
+		try {
+			evidenceKurentoExecutor.execute(task);
+		} catch (RuntimeException e) {
+			log.warn("MK evidence dropped KMS task {} because queue is full or executor is unavailable", description, e);
+		}
+	}
+
 	private enum EvidenceRecordingState {
 		RECORDING,
+		STOP_PENDING,
 		STOPPING,
 		STOPPED,
 		FAILED
@@ -792,6 +957,7 @@ public class EvidenceRecordingService {
 		String connectionId;
 		long clientCreated;
 		volatile EvidenceRecordingState state = EvidenceRecordingState.RECORDING;
+		volatile ScheduledFuture<?> pendingStopFuture;
 
 		ActiveEvidenceRecording(RecorderEndpoint recorder, PublisherEndpoint publisher, File file, long startMs,
 				String sessionId, int playerNumber, String connectionId, long clientCreated) {
