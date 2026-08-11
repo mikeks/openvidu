@@ -75,10 +75,15 @@ public class EvidenceRestController {
         return new ResponseEntity<>(result, HttpStatus.OK);
     }
 
-    @RequestMapping(value = "/start-player/{sessionId}/{playerNumber}", method = RequestMethod.POST)
-    public ResponseEntity<?> startPlayerEvidence(
+    @RequestMapping(value = "/start-user/{sessionId}/{userIdentity}", method = RequestMethod.POST)
+    public ResponseEntity<?> startUserEvidence(
             @PathVariable("sessionId") String sessionId,
-            @PathVariable("playerNumber") int playerNumber) {
+            @PathVariable("userIdentity") String userIdentity) {
+
+        Integer userId = parseUserIdentity(userIdentity);
+        if (userId == null) {
+            return new ResponseEntity<>("invalid-user-identity", HttpStatus.BAD_REQUEST);
+        }
 
         Session session = this.sessionManager.getSessionWithNotActive(sessionId);
 
@@ -86,36 +91,41 @@ public class EvidenceRestController {
             return new ResponseEntity<>("session-not-found", HttpStatus.NOT_FOUND);
         }
 
-        Participant participant = findNewestParticipantByPlayerNumber(session, playerNumber);
+        Participant participant = findNewestParticipantByUserId(session, userId);
 
         if (participant == null) {
-            return new ResponseEntity<>("player-not-found-or-not-active", HttpStatus.NOT_FOUND);
+            return new ResponseEntity<>("user-not-found-or-not-active", HttpStatus.NOT_FOUND);
         }
 
-        String result = evidenceRecordingService.startForPlayer(session, participant, playerNumber);
+        String result = evidenceRecordingService.startForUser(session, participant, userId);
 
         return new ResponseEntity<>(result, HttpStatus.OK);
     }
 
-    @RequestMapping(value = "/stop-player/{sessionId}/{playerNumber}", method = RequestMethod.POST)
-    public ResponseEntity<?> stopPlayerEvidence(
+    @RequestMapping(value = "/stop-user/{sessionId}/{userIdentity}", method = RequestMethod.POST)
+    public ResponseEntity<?> stopUserEvidence(
             @PathVariable("sessionId") String sessionId,
-            @PathVariable("playerNumber") int playerNumber) {
+            @PathVariable("userIdentity") String userIdentity) {
 
-        String result = evidenceRecordingService.stopPlayer(sessionId, playerNumber);
+        Integer userId = parseUserIdentity(userIdentity);
+        if (userId == null) {
+            return new ResponseEntity<>("invalid-user-identity", HttpStatus.BAD_REQUEST);
+        }
+
+        String result = evidenceRecordingService.stopUser(sessionId, userId);
 
         return new ResponseEntity<>(result, HttpStatus.OK);
     }
 
-    @RequestMapping(value = "/snapshot/{roomId}/{playerNumber}/{startEpoch}/{stopEpoch}", method = { RequestMethod.GET,
+    @RequestMapping(value = "/snapshot/{roomId}/{userIdentity}/{startEpoch}/{stopEpoch}", method = { RequestMethod.GET,
             RequestMethod.POST })
     public ResponseEntity<?> snapshot(
             @PathVariable("roomId") String roomId,
-            @PathVariable("playerNumber") int playerNumber,
+            @PathVariable("userIdentity") String userIdentity,
             @PathVariable("startEpoch") long startEpoch,
             @PathVariable("stopEpoch") long stopEpoch) {
 
-        SnapshotResult result = evidenceRecordingService.buildSnapshot(roomId, playerNumber, startEpoch, stopEpoch);
+        SnapshotResult result = evidenceRecordingService.buildSnapshot(roomId, userIdentity, startEpoch, stopEpoch);
 
         if (result.ready) {
             return ResponseEntity.ok()
@@ -161,10 +171,12 @@ public class EvidenceRestController {
                 JsonObject pJson = participant.toJson();
                 item.add("participantJson", pJson);
 
-                PlayerClientInfo info = parsePlayerClientInfo(participant);
-                item.addProperty("metadata", info.metadata);
+                EvidenceIdentityInfo info = parseEvidenceIdentityInfo(participant);
+                item.addProperty("clientMetadata", info.clientMetadata);
+                item.addProperty("serverMetadata", info.serverMetadata);
                 item.addProperty("clientData", info.clientData);
-                item.addProperty("playerNumber", info.playerNumber);
+                item.addProperty("userId", info.userId);
+                item.addProperty("isSpectator", info.isSpectator);
                 item.addProperty("created", info.created);
 
             } catch (Exception e) {
@@ -177,48 +189,71 @@ public class EvidenceRestController {
         return new ResponseEntity<>(result.toString(), HttpStatus.OK);
     }
 
-    private Participant findNewestParticipantByPlayerNumber(Session session, int playerNumber) {
+    private Participant findNewestParticipantByUserId(Session session, int userId) {
         Participant best = null;
         long bestCreated = Long.MIN_VALUE;
 
         for (Participant participant : session.getParticipants()) {
             try {
-                PlayerClientInfo info = parsePlayerClientInfo(participant);
+                EvidenceIdentityInfo info = parseEvidenceIdentityInfo(participant);
 
-                if (info.playerNumber == playerNumber && info.created > bestCreated) {
+                if (!info.isSpectator && info.userId == userId && info.created > bestCreated) {
                     best = participant;
                     bestCreated = info.created;
                 }
             } catch (Exception ignored) {
-                // Ignore participants with unexpected/missing clientData
+                // Ignore participants with unexpected/missing metadata
             }
         }
 
         return best;
     }
 
-    private PlayerClientInfo parsePlayerClientInfo(Participant participant) {
-        JsonObject pJson = participant.toJson();
+    private EvidenceIdentityInfo parseEvidenceIdentityInfo(Participant participant) {
+        String serverMetadata = participant.getServerMetadata();
+        JsonObject serverMetadataJson = JsonParser.parseString(serverMetadata).getAsJsonObject();
+        int userId = serverMetadataJson.get("pid").getAsInt();
 
-        String metadata = pJson.get("clientData").getAsString();
-        JsonObject metadataJson = JsonParser.parseString(metadata).getAsJsonObject();
+        String clientMetadata = participant.getClientMetadata();
+        JsonObject clientMetadataJson = JsonParser.parseString(clientMetadata).getAsJsonObject();
+        if (clientMetadataJson.has("userId") && !clientMetadataJson.get("userId").isJsonNull()
+                && clientMetadataJson.get("userId").getAsInt() != userId) {
+            throw new IllegalArgumentException("client/server user id mismatch");
+        }
 
-        String clientData = metadataJson.get("clientData").getAsString();
+        String clientData = clientMetadataJson.get("clientData").getAsString();
         String[] parts = clientData.split("\\.");
 
-        PlayerClientInfo info = new PlayerClientInfo();
-        info.metadata = metadata;
+        EvidenceIdentityInfo info = new EvidenceIdentityInfo();
+        info.clientMetadata = clientMetadata;
+        info.serverMetadata = serverMetadata;
         info.clientData = clientData;
-        info.playerNumber = Integer.parseInt(parts[0]);
-        info.created = Long.parseLong(parts[1]);
+        info.userId = userId;
+        info.isSpectator = serverMetadataJson.has("spec") && !serverMetadataJson.get("spec").isJsonNull()
+                && serverMetadataJson.get("spec").getAsBoolean();
+        info.created = Long.parseLong(parts[parts.length - 1]);
 
         return info;
     }
 
-    private static class PlayerClientInfo {
-        String metadata;
+    private Integer parseUserIdentity(String userIdentity) {
+        if (userIdentity == null || !userIdentity.startsWith("uid-")) {
+            return null;
+        }
+        try {
+            int userId = Integer.parseInt(userIdentity.substring(4));
+            return userId > 0 ? userId : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static class EvidenceIdentityInfo {
+        String clientMetadata;
+        String serverMetadata;
         String clientData;
-        int playerNumber;
+        int userId;
+        boolean isSpectator;
         long created;
     }
 }

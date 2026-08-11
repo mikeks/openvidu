@@ -63,7 +63,6 @@ public class EvidenceRecordingService {
 	private static final int RETRY_AFTER_FINALIZE_GRACE_SECONDS = 2;
 	private static final long MIN_CUT_DURATION_MS = 1000;
 	private static final long MIN_CUT_FILE_BYTES = 1024;
-	private static final int MAX_PLAYER_NUMBER = 99;
 	private static final long RECORDER_STOP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(15);
 	private static final long RECORDER_STOP_DELAY_MS = TimeUnit.SECONDS.toMillis(30);
 	private static final long EVIDENCE_KMS_BACKOFF_MS = TimeUnit.MINUTES.toMillis(1);
@@ -149,25 +148,28 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	public synchronized String startForPlayer(Session session, Participant participant, int playerNumber) {
-		PlayerClientInfo info = parsePlayerClientInfo(participant);
-		long clientCreated = info != null ? info.created : 0;
-		cancelPendingEvidenceStart(session.getSessionId(), playerNumber);
-		String result = startContinuous(session, participant, playerNumber, clientCreated, true);
+	public synchronized String startForUser(Session session, Participant participant, int userId) {
+		EvidenceIdentityInfo info = parseEvidenceIdentityInfo(participant);
+		if (info == null || info.isSpectator || info.userId != userId) {
+			return "user-excluded";
+		}
+		long clientCreated = info.created;
+		cancelPendingEvidenceStart(session.getSessionId(), userId);
+		String result = startContinuous(session, participant, userId, clientCreated, true);
 		if (result == null) {
-			return "player-excluded";
+			return "user-excluded";
 		}
 		return result;
 	}
 
-	public synchronized String stopPlayer(String sessionId, int playerNumber) {
-		cancelPendingEvidenceStart(sessionId, playerNumber);
-		return stopContinuous(sessionId, playerNumber);
+	public synchronized String stopUser(String sessionId, int userId) {
+		cancelPendingEvidenceStart(sessionId, userId);
+		return stopContinuous(sessionId, userId);
 	}
 
 	public void startContinuousOnAudioFlowIfEligible(Session session, Participant participant) {
-		PlayerClientInfo info = parsePlayerClientInfo(participant);
-		if (info == null || info.playerNumber > MAX_PLAYER_NUMBER) {
+		EvidenceIdentityInfo info = parseEvidenceIdentityInfo(participant);
+		if (info == null || info.isSpectator) {
 			return;
 		}
 
@@ -178,8 +180,8 @@ public class EvidenceRecordingService {
 			return;
 		}
 
-		String key = evidenceKey(session.getSessionId(), info.playerNumber);
-		PendingEvidenceStart pending = new PendingEvidenceStart(session, participant, publisher, key, info.playerNumber,
+		String key = evidenceKey(session.getSessionId(), info.userId);
+		PendingEvidenceStart pending = new PendingEvidenceStart(session, participant, publisher, key, info.userId,
 				info.created, participant.getParticipantPublicId());
 		PendingEvidenceStart previous = pendingEvidenceStarts.put(key, pending);
 		if (previous != null) {
@@ -189,25 +191,26 @@ public class EvidenceRecordingService {
 		ListenerSubscription subscription = publisher.getEndpoint().addMediaFlowOutStateChangeListener(event -> {
 			if (event.getState() == MediaFlowState.FLOWING && event.getMediaType() == MediaType.AUDIO) {
 				executeEvidenceKurentoTask(() -> startPendingContinuous(pending, "audio-flow"),
-						"start " + session.getSessionId() + " player " + info.playerNumber);
+						"start " + session.getSessionId() + " user " + info.userId);
 			}
 		});
 		pending.setSubscription(subscription);
 	}
 
 	public void stopContinuousIfParticipant(Participant participant) {
-		PlayerClientInfo info = parsePlayerClientInfo(participant);
-		if (info == null || info.playerNumber > MAX_PLAYER_NUMBER) {
+		EvidenceIdentityInfo info = parseEvidenceIdentityInfo(participant);
+		if (info == null || info.isSpectator) {
 			return;
 		}
-		cancelPendingEvidenceStart(participant.getSessionId(), info.playerNumber);
-		scheduleStopContinuous(participant.getSessionId(), info.playerNumber, info.created,
+		cancelPendingEvidenceStart(participant.getSessionId(), info.userId);
+		scheduleStopContinuous(participant.getSessionId(), info.userId, info.created,
 				participant.getParticipantPublicId(), "participant-stop");
 	}
 
-	public synchronized SnapshotResult buildSnapshot(String roomId, int playerNumber, long startEpoch, long stopEpoch) {
-		if (playerNumber > MAX_PLAYER_NUMBER) {
-			return SnapshotResult.error("player-excluded", 400);
+	public synchronized SnapshotResult buildSnapshot(String roomId, String userIdentity, long startEpoch, long stopEpoch) {
+		Integer userId = parseUserIdentity(userIdentity);
+		if (userId == null) {
+			return SnapshotResult.error("invalid-user-identity", 400);
 		}
 
 		long startMs = normalizeEpoch(startEpoch);
@@ -218,28 +221,28 @@ public class EvidenceRecordingService {
 		}
 
 		String sessionId = resolveSessionId(roomId);
-		File playerDir = getPlayerDir(sessionId, playerNumber);
-		if (!playerDir.exists() || !playerDir.isDirectory()) {
+		File userDir = getUserDir(sessionId, userId);
+		if (!userDir.exists() || !userDir.isDirectory()) {
 			return SnapshotResult.error("recording-not-found", 404);
 		}
 
-		ActiveSegment active = findActiveSegment(sessionId, playerNumber);
+		ActiveSegment active = findActiveSegment(sessionId, userId);
 		if (active != null && active.startMs < stopMs) {
 			long nowMs = System.currentTimeMillis();
 			if (stopMs > nowMs) {
 				return SnapshotResult.retry("requested-range-is-still-recording",
 						retryAfterSeconds(stopMs - nowMs));
 			}
-			scheduleRotateContinuousSegment(sessionId, playerNumber);
+			scheduleRotateContinuousSegment(sessionId, userId);
 			return SnapshotResult.retry("requested-range-is-still-recording", RETRY_AFTER_FINALIZE_GRACE_SECONDS);
 		}
 
-		List<Segment> overlappingSegments = findOverlappingSegments(sessionId, playerNumber, playerDir, startMs, stopMs);
+		List<Segment> overlappingSegments = findOverlappingSegments(sessionId, userId, userDir, startMs, stopMs);
 		if (overlappingSegments.isEmpty()) {
 			return SnapshotResult.error("recording-not-found", 404);
 		}
 
-		File snapshotDir = new File(playerDir, "snapshots");
+		File snapshotDir = new File(userDir, "snapshots");
 		snapshotDir.mkdirs();
 		File outputFile = new File(snapshotDir, "snapshot_" + startMs + "_" + stopMs + ".webm");
 
@@ -283,7 +286,7 @@ public class EvidenceRecordingService {
 
 			return SnapshotResult.ready(outputFile);
 		} catch (Exception e) {
-			log.error("MK evidence snapshot failed roomId={} playerNumber={} start={} stop={}", roomId, playerNumber,
+			log.error("MK evidence snapshot failed roomId={} userId={} start={} stop={}", roomId, userId,
 					startMs, stopMs, e);
 			outputFile.delete();
 			return SnapshotResult.error("snapshot-build-failed: " + e.getMessage(), 500);
@@ -292,9 +295,9 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private synchronized String startContinuous(Session session, Participant participant, int playerNumber, long clientCreated,
+	private synchronized String startContinuous(Session session, Participant participant, int userId, long clientCreated,
 			boolean manual) {
-		if (playerNumber > MAX_PLAYER_NUMBER) {
+		if (userId <= 0) {
 			return null;
 		}
 		if (isEvidenceBackoffActive()) {
@@ -303,14 +306,14 @@ public class EvidenceRecordingService {
 
 		String sessionId = session.getSessionId();
 		String connectionId = participant.getParticipantPublicId();
-		String key = evidenceKey(sessionId, playerNumber);
+		String key = evidenceKey(sessionId, userId);
 
 		ActiveEvidenceRecording current = activeEvidenceRecordings.get(key);
 		if (current != null) {
 			if (current.clientCreated > clientCreated) {
 				log.info(
-						"MK evidence continuous ignoring obsolete publisher session={} playerNumber={} connectionId={} clientCreated={} activeClientCreated={}",
-						sessionId, playerNumber, connectionId, clientCreated, current.clientCreated);
+						"MK evidence continuous ignoring obsolete publisher session={} userId={} connectionId={} clientCreated={} activeClientCreated={}",
+						sessionId, userId, connectionId, clientCreated, current.clientCreated);
 				return "obsolete-player-connection";
 			}
 			cancelDelayedStop(current, "replace-active");
@@ -333,12 +336,12 @@ public class EvidenceRecordingService {
 		}
 
 		long startMs = System.currentTimeMillis();
-		File dir = getPlayerDir(sessionId, playerNumber);
+		File dir = getUserDir(sessionId, userId);
 		dir.mkdirs();
 
 		File activeFile = new File(dir, "active_" + startMs + "_" + sanitizeFilePart(connectionId) + ".webm");
 		ActiveEvidenceRecording pendingLog = new ActiveEvidenceRecording(null, publisher, activeFile, startMs, sessionId,
-				playerNumber, connectionId, clientCreated);
+				userId, connectionId, clientCreated);
 
 		try {
 			logEvidence("START_BEGIN manual=" + manual, pendingLog, activeFile);
@@ -357,26 +360,26 @@ public class EvidenceRecordingService {
 					activeFile);
 
 			activeEvidenceRecordings.put(key,
-					new ActiveEvidenceRecording(recorder, publisher, activeFile, startMs, sessionId, playerNumber, connectionId,
+					new ActiveEvidenceRecording(recorder, publisher, activeFile, startMs, sessionId, userId, connectionId,
 							clientCreated));
 
 			logEvidence("STARTED manual=" + manual, activeEvidenceRecordings.get(key), activeFile);
 
 			log.info(
-					"MK evidence continuous START session={} playerNumber={} connectionId={} clientCreated={} file={} manual={}",
-					sessionId, playerNumber, connectionId, clientCreated, activeFile.getAbsolutePath(), manual);
+					"MK evidence continuous START session={} userId={} connectionId={} clientCreated={} file={} manual={}",
+					sessionId, userId, connectionId, clientCreated, activeFile.getAbsolutePath(), manual);
 
 			return activeFile.getAbsolutePath();
 		} catch (Exception e) {
-			log.error("MK evidence continuous START failed session={} playerNumber={} connectionId={}", sessionId,
-					playerNumber, connectionId, e);
+			log.error("MK evidence continuous START failed session={} userId={} connectionId={}", sessionId,
+					userId, connectionId, e);
 			markEvidenceBackoffIfKurentoTransportFailure(e);
 			return "error: " + e.getMessage();
 		}
 	}
 
-	private String rotateContinuousSegment(String sessionId, int playerNumber) {
-		String key = evidenceKey(sessionId, playerNumber);
+	private String rotateContinuousSegment(String sessionId, int userId) {
+		String key = evidenceKey(sessionId, userId);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.remove(key);
 
 		if (active == null) {
@@ -390,13 +393,13 @@ public class EvidenceRecordingService {
 		return finalFile.getAbsolutePath();
 	}
 
-	private synchronized String stopContinuous(String sessionId, int playerNumber) {
-		return stopContinuous(sessionId, playerNumber, null, null, "manual-stop");
+	private synchronized String stopContinuous(String sessionId, int userId) {
+		return stopContinuous(sessionId, userId, null, null, "manual-stop");
 	}
 
-	private synchronized String stopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId,
+	private synchronized String stopContinuous(String sessionId, int userId, Long clientCreated, String connectionId,
 			String reason) {
-		String key = evidenceKey(sessionId, playerNumber);
+		String key = evidenceKey(sessionId, userId);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
 
 		if (active == null) {
@@ -405,8 +408,8 @@ public class EvidenceRecordingService {
 
 		if (clientCreated != null && active.clientCreated != clientCreated.longValue()) {
 			log.info(
-					"MK evidence continuous ignoring obsolete stop session={} playerNumber={} connectionId={} clientCreated={} activeConnectionId={} activeClientCreated={}",
-					sessionId, playerNumber, connectionId, clientCreated, active.connectionId, active.clientCreated);
+					"MK evidence continuous ignoring obsolete stop session={} userId={} connectionId={} clientCreated={} activeConnectionId={} activeClientCreated={}",
+					sessionId, userId, connectionId, clientCreated, active.connectionId, active.clientCreated);
 			return "obsolete-player-connection";
 		}
 
@@ -420,25 +423,25 @@ public class EvidenceRecordingService {
 		return finalFile.getAbsolutePath();
 	}
 
-	private void scheduleStopContinuous(String sessionId, int playerNumber, Long clientCreated, String connectionId,
+	private void scheduleStopContinuous(String sessionId, int userId, Long clientCreated, String connectionId,
 			String reason) {
-		executeEvidenceKurentoTask(() -> scheduleStopContinuousDelayed(sessionId, playerNumber, clientCreated, connectionId, reason),
-				"stop " + sessionId + " player " + playerNumber);
+		executeEvidenceKurentoTask(() -> scheduleStopContinuousDelayed(sessionId, userId, clientCreated, connectionId, reason),
+				"stop " + sessionId + " user " + userId);
 	}
 
-	private void scheduleRotateContinuousSegment(String sessionId, int playerNumber) {
-		executeEvidenceKurentoTask(() -> rotateContinuousSegment(sessionId, playerNumber),
-				"rotate " + sessionId + " player " + playerNumber);
+	private void scheduleRotateContinuousSegment(String sessionId, int userId) {
+		executeEvidenceKurentoTask(() -> rotateContinuousSegment(sessionId, userId),
+				"rotate " + sessionId + " user " + userId);
 	}
 
 	private void stopRecorderAsync(ActiveEvidenceRecording active, File finalFile, String reason, boolean restartAfterStop) {
 		executeEvidenceKurentoTask(() -> stopRecorder(active, finalFile, reason, restartAfterStop),
-				"stop-recorder " + active.sessionId + " player " + active.playerNumber + " reason " + reason);
+				"stop-recorder " + active.sessionId + " user " + active.userId + " reason " + reason);
 	}
 
-	private synchronized String scheduleStopContinuousDelayed(String sessionId, int playerNumber, Long clientCreated,
+	private synchronized String scheduleStopContinuousDelayed(String sessionId, int userId, Long clientCreated,
 			String connectionId, String reason) {
-		String key = evidenceKey(sessionId, playerNumber);
+		String key = evidenceKey(sessionId, userId);
 		ActiveEvidenceRecording active = activeEvidenceRecordings.get(key);
 
 		if (active == null) {
@@ -447,8 +450,8 @@ public class EvidenceRecordingService {
 
 		if (clientCreated != null && active.clientCreated != clientCreated.longValue()) {
 			log.info(
-					"MK evidence continuous ignoring obsolete delayed stop session={} playerNumber={} connectionId={} clientCreated={} activeConnectionId={} activeClientCreated={}",
-					sessionId, playerNumber, connectionId, clientCreated, active.connectionId, active.clientCreated);
+					"MK evidence continuous ignoring obsolete delayed stop session={} userId={} connectionId={} clientCreated={} activeConnectionId={} activeClientCreated={}",
+					sessionId, userId, connectionId, clientCreated, active.connectionId, active.clientCreated);
 			return "obsolete-player-connection";
 		}
 
@@ -472,7 +475,7 @@ public class EvidenceRecordingService {
 					return;
 				}
 				active.pendingStopFuture = null;
-				activeEvidenceRecordings.remove(evidenceKey(active.sessionId, active.playerNumber), active);
+				activeEvidenceRecordings.remove(evidenceKey(active.sessionId, active.userId), active);
 			}
 
 			logEvidence("STOP_DELAY_FIRED reason=" + reason, active, finalFile);
@@ -542,8 +545,8 @@ public class EvidenceRecordingService {
 				}
 			}
 		} catch (Exception e) {
-			log.error("MK evidence continuous STOP failed session={} playerNumber={} connectionId={}", active.sessionId,
-					active.playerNumber, active.connectionId, e);
+			log.error("MK evidence continuous STOP failed session={} userId={} connectionId={}", active.sessionId,
+					active.userId, active.connectionId, e);
 			logEvidence("STOP_FAILED reason=" + reason + " error=" + e.getMessage(), active, finalFile);
 			if (isKurentoMediaObjectNotFound(e)) {
 				logEvidence("STOP_ALREADY_GONE reason=" + reason, active, finalFile);
@@ -574,12 +577,12 @@ public class EvidenceRecordingService {
 			logEvidence("FILE_MOVED durationMs=" + (System.currentTimeMillis() - moveStartMs), active, finalFile);
 			active.state = EvidenceRecordingState.STOPPED;
 
-			log.info("MK evidence continuous STOP session={} playerNumber={} connectionId={} file={}", active.sessionId,
-					active.playerNumber, active.connectionId, finalFile.getAbsolutePath());
+			log.info("MK evidence continuous STOP session={} userId={} connectionId={} file={}", active.sessionId,
+					active.userId, active.connectionId, finalFile.getAbsolutePath());
 			logEvidence("STOPPED reason=" + reason + " stoppedTimestamp=" + stoppedTimestamp, active, finalFile);
 		} catch (Exception e) {
-			log.error("MK evidence continuous FINALIZE failed session={} playerNumber={} connectionId={}",
-					active.sessionId, active.playerNumber, active.connectionId, e);
+			log.error("MK evidence continuous FINALIZE failed session={} userId={} connectionId={}",
+					active.sessionId, active.userId, active.connectionId, e);
 			logEvidence("FINALIZE_FAILED reason=" + reason + " error=" + e.getMessage(), active, finalFile);
 			active.state = EvidenceRecordingState.FAILED;
 		}
@@ -592,15 +595,15 @@ public class EvidenceRecordingService {
 			active.recorder.release();
 			logEvidence("RELEASED durationMs=" + (System.currentTimeMillis() - releaseStartMs), active, null);
 		} catch (Exception e) {
-			log.warn("MK evidence continuous RELEASE failed session={} playerNumber={} connectionId={}",
-					active.sessionId, active.playerNumber, active.connectionId, e);
+			log.warn("MK evidence continuous RELEASE failed session={} userId={} connectionId={}",
+					active.sessionId, active.userId, active.connectionId, e);
 			logEvidence("RELEASE_FAILED error=" + e.getMessage(), active, null);
 			markEvidenceBackoffIfKurentoTransportFailure(e);
 		}
 	}
 
 	private void startNextContinuousSegment(ActiveEvidenceRecording previous) {
-		String key = evidenceKey(previous.sessionId, previous.playerNumber);
+		String key = evidenceKey(previous.sessionId, previous.userId);
 		if (activeEvidenceRecordings.containsKey(key)) {
 			logEvidence("RESTART_SKIPPED existing-active", previous, null);
 			return;
@@ -622,15 +625,15 @@ public class EvidenceRecordingService {
 			recorder.record();
 
 			ActiveEvidenceRecording next = new ActiveEvidenceRecording(recorder, previous.publisher, activeFile, startMs,
-					previous.sessionId, previous.playerNumber, previous.connectionId, previous.clientCreated);
+					previous.sessionId, previous.userId, previous.connectionId, previous.clientCreated);
 			activeEvidenceRecordings.put(key, next);
 
-			log.info("MK evidence continuous RESTART session={} playerNumber={} connectionId={} file={}",
-					previous.sessionId, previous.playerNumber, previous.connectionId, activeFile.getAbsolutePath());
+			log.info("MK evidence continuous RESTART session={} userId={} connectionId={} file={}",
+					previous.sessionId, previous.userId, previous.connectionId, activeFile.getAbsolutePath());
 			logEvidence("RESTARTED", next, activeFile);
 		} catch (Exception e) {
-			log.error("MK evidence continuous RESTART failed session={} playerNumber={} connectionId={}",
-					previous.sessionId, previous.playerNumber, previous.connectionId, e);
+			log.error("MK evidence continuous RESTART failed session={} userId={} connectionId={}",
+					previous.sessionId, previous.userId, previous.connectionId, e);
 			logEvidence("RESTART_FAILED error=" + e.getMessage(), previous, activeFile);
 			markEvidenceBackoffIfKurentoTransportFailure(e);
 		}
@@ -650,53 +653,83 @@ public class EvidenceRecordingService {
 		pendingEvidenceStarts.remove(pending.key, pending);
 		pending.dispose();
 
-		PlayerClientInfo currentInfo = parsePlayerClientInfo(pending.participant);
-		if (currentInfo == null || currentInfo.playerNumber != pending.playerNumber
+		EvidenceIdentityInfo currentInfo = parseEvidenceIdentityInfo(pending.participant);
+		if (currentInfo == null || currentInfo.userId != pending.userId
 				|| currentInfo.created != pending.clientCreated) {
 			log.info(
-					"MK evidence continuous START skipped obsolete media event session={} playerNumber={} connectionId={} reason={}",
-					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+					"MK evidence continuous START skipped obsolete media event session={} userId={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.userId, pending.connectionId, reason);
 			return;
 		}
 
 		if (!pending.participant.isStreaming()) {
 			log.info(
-					"MK evidence continuous START skipped non-streaming participant session={} playerNumber={} connectionId={} reason={}",
-					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+					"MK evidence continuous START skipped non-streaming participant session={} userId={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.userId, pending.connectionId, reason);
 			return;
 		}
 
 		KurentoParticipant kp = (KurentoParticipant) pending.participant;
 		if (kp.getPublisher() != pending.publisher) {
 			log.info(
-					"MK evidence continuous START skipped replaced publisher session={} playerNumber={} connectionId={} reason={}",
-					pending.session.getSessionId(), pending.playerNumber, pending.connectionId, reason);
+					"MK evidence continuous START skipped replaced publisher session={} userId={} connectionId={} reason={}",
+					pending.session.getSessionId(), pending.userId, pending.connectionId, reason);
 			return;
 		}
 
-		startContinuous(pending.session, pending.participant, pending.playerNumber, pending.clientCreated, false);
+		startContinuous(pending.session, pending.participant, pending.userId, pending.clientCreated, false);
 	}
 
-	private void cancelPendingEvidenceStart(String sessionId, int playerNumber) {
-		PendingEvidenceStart pending = pendingEvidenceStarts.remove(evidenceKey(sessionId, playerNumber));
+	private void cancelPendingEvidenceStart(String sessionId, int userId) {
+		PendingEvidenceStart pending = pendingEvidenceStarts.remove(evidenceKey(sessionId, userId));
 		if (pending != null) {
 			pending.dispose();
 		}
 	}
 
-	private PlayerClientInfo parsePlayerClientInfo(Participant participant) {
+	private EvidenceIdentityInfo parseEvidenceIdentityInfo(Participant participant) {
 		try {
-			JsonObject pJson = participant.toJson();
-			String metadata = pJson.get("clientData").getAsString();
-			JsonObject metadataJson = JsonParser.parseString(metadata).getAsJsonObject();
-			String clientData = metadataJson.get("clientData").getAsString();
+			String serverMetadata = participant.getServerMetadata();
+			if (serverMetadata == null || serverMetadata.isEmpty()) {
+				return null;
+			}
+			JsonObject serverMetadataJson = JsonParser.parseString(serverMetadata).getAsJsonObject();
+			if (!serverMetadataJson.has("pid") || serverMetadataJson.get("pid").isJsonNull()) {
+				return null;
+			}
+			int userId = serverMetadataJson.get("pid").getAsInt();
+			if (userId <= 0) {
+				return null;
+			}
+
+			String clientMetadata = participant.getClientMetadata();
+			JsonObject clientMetadataJson = JsonParser.parseString(clientMetadata).getAsJsonObject();
+			if (clientMetadataJson.has("userId") && !clientMetadataJson.get("userId").isJsonNull()
+					&& clientMetadataJson.get("userId").getAsInt() != userId) {
+				return null;
+			}
+			String clientData = clientMetadataJson.get("clientData").getAsString();
 			String[] parts = clientData.split("\\.");
 
-			PlayerClientInfo info = new PlayerClientInfo();
-			info.playerNumber = Integer.parseInt(parts[0]);
-			info.created = Long.parseLong(parts[1]);
+			EvidenceIdentityInfo info = new EvidenceIdentityInfo();
+			info.userId = userId;
+			info.isSpectator = serverMetadataJson.has("spec") && !serverMetadataJson.get("spec").isJsonNull()
+					&& serverMetadataJson.get("spec").getAsBoolean();
+			info.created = Long.parseLong(parts[parts.length - 1]);
 			return info;
 		} catch (Exception ignored) {
+			return null;
+		}
+	}
+
+	private Integer parseUserIdentity(String userIdentity) {
+		if (userIdentity == null || !userIdentity.startsWith("uid-")) {
+			return null;
+		}
+		try {
+			int userId = Integer.parseInt(userIdentity.substring(4));
+			return userId > 0 ? userId : null;
+		} catch (NumberFormatException e) {
 			return null;
 		}
 	}
@@ -712,12 +745,12 @@ public class EvidenceRecordingService {
 		return "MafiaRoom" + roomId;
 	}
 
-	private File getPlayerDir(String sessionId, int playerNumber) {
-		return new File(BASE_PATH + sessionId + "/player_" + playerNumber);
+	private File getUserDir(String sessionId, int userId) {
+		return new File(BASE_PATH + sessionId + "/user_" + userId);
 	}
 
-	private String evidenceKey(String sessionId, int playerNumber) {
-		return sessionId + ":player:" + playerNumber;
+	private String evidenceKey(String sessionId, int userId) {
+		return sessionId + ":user:" + userId;
 	}
 
 	private String sanitizeFilePart(String value) {
@@ -731,14 +764,14 @@ public class EvidenceRecordingService {
 		return epoch;
 	}
 
-	private List<Segment> findOverlappingSegments(String sessionId, int playerNumber, File playerDir, long startMs,
+	private List<Segment> findOverlappingSegments(String sessionId, int userId, File userDir, long startMs,
 			long stopMs) {
 		List<Segment> result = new ArrayList<>();
-		File[] files = playerDir.listFiles();
+		File[] files = userDir.listFiles();
 		if (files == null) {
 			return result;
 		}
-		ActiveEvidenceRecording current = activeEvidenceRecordings.get(evidenceKey(sessionId, playerNumber));
+		ActiveEvidenceRecording current = activeEvidenceRecordings.get(evidenceKey(sessionId, userId));
 		for (File file : files) {
 			Matcher matcher = FINAL_SEGMENT_PATTERN.matcher(file.getName());
 			if (file.isFile() && matcher.matches()) {
@@ -763,8 +796,8 @@ public class EvidenceRecordingService {
 		return result;
 	}
 
-	private ActiveSegment findActiveSegment(String sessionId, int playerNumber) {
-		ActiveEvidenceRecording active = activeEvidenceRecordings.get(evidenceKey(sessionId, playerNumber));
+	private ActiveSegment findActiveSegment(String sessionId, int userId) {
+		ActiveEvidenceRecording active = activeEvidenceRecordings.get(evidenceKey(sessionId, userId));
 		return active == null ? null : new ActiveSegment(active.startMs);
 	}
 
@@ -867,7 +900,7 @@ public class EvidenceRecordingService {
 				+ " action=\"" + action + "\""
 				+ " state=" + (active != null ? active.state : "null")
 				+ " session=" + (active != null ? active.sessionId : "null")
-				+ " player=" + (active != null ? active.playerNumber : 0)
+				+ " userId=" + (active != null ? active.userId : 0)
 				+ " connection=" + (active != null ? active.connectionId : "null")
 				+ " clientCreated=" + (active != null ? active.clientCreated : 0)
 				+ " activeFile=\"" + (active != null && active.file != null ? active.file.getAbsolutePath() : "") + "\""
@@ -953,20 +986,20 @@ public class EvidenceRecordingService {
 		File file;
 		long startMs;
 		String sessionId;
-		int playerNumber;
+		int userId;
 		String connectionId;
 		long clientCreated;
 		volatile EvidenceRecordingState state = EvidenceRecordingState.RECORDING;
 		volatile ScheduledFuture<?> pendingStopFuture;
 
 		ActiveEvidenceRecording(RecorderEndpoint recorder, PublisherEndpoint publisher, File file, long startMs,
-				String sessionId, int playerNumber, String connectionId, long clientCreated) {
+				String sessionId, int userId, String connectionId, long clientCreated) {
 			this.recorder = recorder;
 			this.publisher = publisher;
 			this.file = file;
 			this.startMs = startMs;
 			this.sessionId = sessionId;
-			this.playerNumber = playerNumber;
+			this.userId = userId;
 			this.connectionId = connectionId;
 			this.clientCreated = clientCreated;
 		}
@@ -977,19 +1010,19 @@ public class EvidenceRecordingService {
 		Participant participant;
 		PublisherEndpoint publisher;
 		String key;
-		int playerNumber;
+		int userId;
 		long clientCreated;
 		String connectionId;
 		private final AtomicBoolean completed = new AtomicBoolean(false);
 		private volatile ListenerSubscription subscription;
 
 		PendingEvidenceStart(Session session, Participant participant, PublisherEndpoint publisher, String key,
-				int playerNumber, long clientCreated, String connectionId) {
+				int userId, long clientCreated, String connectionId) {
 			this.session = session;
 			this.participant = participant;
 			this.publisher = publisher;
 			this.key = key;
-			this.playerNumber = playerNumber;
+			this.userId = userId;
 			this.clientCreated = clientCreated;
 			this.connectionId = connectionId;
 		}
@@ -1019,8 +1052,9 @@ public class EvidenceRecordingService {
 		}
 	}
 
-	private static class PlayerClientInfo {
-		int playerNumber;
+	private static class EvidenceIdentityInfo {
+		int userId;
+		boolean isSpectator;
 		long created;
 	}
 
