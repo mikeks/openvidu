@@ -17,6 +17,9 @@
 
 package io.openvidu.server.kurento.core;
 
+import static io.openvidu.server.kurento.endpoint.MediaLifecycleDiagnostics.record;
+import static io.openvidu.server.kurento.endpoint.MediaLifecycleDiagnostics.Event.*;
+
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -34,7 +37,6 @@ import java.util.function.Function;
 
 import org.apache.commons.lang3.RandomStringUtils;
 import org.kurento.client.Continuation;
-import org.kurento.client.Endpoint;
 import org.kurento.client.ErrorEvent;
 import org.kurento.client.Filter;
 import org.kurento.client.IceCandidate;
@@ -81,8 +83,8 @@ public class KurentoParticipant extends Participant {
 	private final KurentoSession session;
 	private KurentoParticipantEndpointConfig endpointConfig;
 
-	private PublisherEndpoint publisher;
-	private CountDownLatch publisherLatch = new CountDownLatch(1);
+	private volatile PublisherEndpoint publisher;
+	private volatile CountDownLatch publisherLatch = new CountDownLatch(1);
 
 	private final ConcurrentMap<String, Filter> filters = new ConcurrentHashMap<>();
 	private final ConcurrentMap<String, SubscriberEndpoint> subscribers = new ConcurrentHashMap<String, SubscriberEndpoint>();
@@ -111,20 +113,27 @@ public class KurentoParticipant extends Participant {
 	}
 
 	public void createPublishingEndpoint(MediaOptions mediaOptions, String streamId) {
-		publisher.setStreamId(streamId);
-		publisher.setEndpointName(streamId);
-		publisher.setMediaOptions(mediaOptions);
-		publisher.createEndpoint(publisherLatch);
-		if (getPublisher().getEndpoint() == null) {
-			throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Unable to create publisher endpoint");
+		final PublisherEndpoint creatingPublisher = publisher;
+		final CountDownLatch creatingLatch = publisherLatch;
+		try {
+			creatingPublisher.setStreamId(streamId);
+			creatingPublisher.setEndpointName(streamId);
+			creatingPublisher.setMediaOptions(mediaOptions);
+			creatingPublisher.createEndpoint(creatingLatch);
+			awaitPublisherEndpoint(creatingLatch);
+			if (creatingPublisher.isDisposed() || publisher != creatingPublisher || creatingPublisher.getEndpoint() == null) {
+				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Unable to create publisher endpoint");
+			}
+			creatingPublisher.getEndpoint().setName(streamId);
+			endpointConfig.addEndpointListeners(creatingPublisher, "publisher");
+			this.session.publishedStreamIds.putIfAbsent(streamId, this.getParticipantPrivateId());
+		} catch (RuntimeException e) {
+			creatingPublisher.disposeEndpoint();
+			for (MediaElement element : creatingPublisher.getMediaElements()) {
+				releaseElement(getParticipantPublicId(), element);
+			}
+			throw e;
 		}
-		publisher.getEndpoint().setName(streamId);
-
-		endpointConfig.addEndpointListeners(this.publisher, "publisher");
-
-		// Put streamId in publisher's map
-		this.session.publishedStreamIds.putIfAbsent(this.getPublisherStreamId(), this.getParticipantPrivateId());
-
 	}
 
 	public synchronized Filter getFilterElement(String id) {
@@ -152,16 +161,21 @@ public class KurentoParticipant extends Participant {
 	}
 
 	public PublisherEndpoint getPublisher() {
+		awaitPublisherEndpoint(publisherLatch);
+		return this.publisher;
+	}
+
+	private void awaitPublisherEndpoint(CountDownLatch latch) {
 		try {
-			if (!publisherLatch.await(KurentoSession.ASYNC_LATCH_TIMEOUT, TimeUnit.SECONDS)) {
+			if (!latch.await(KurentoSession.ASYNC_LATCH_TIMEOUT, TimeUnit.SECONDS)) {
 				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE,
 						"Timeout reached while waiting for publisher endpoint to be ready");
 			}
 		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 			throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE,
 					"Interrupted while waiting for publisher endpoint to be ready: " + e.getMessage());
 		}
-		return this.publisher;
 	}
 
 	public SubscriberEndpoint getSubscriber(String senderPublicId) {
@@ -253,7 +267,7 @@ public class KurentoParticipant extends Participant {
 					} catch (KurentoServerException e) {
 						log.error("Exception preparing subscriber endpoint for user {}: {}",
 								this.getParticipantPublicId(), e.getMessage());
-						this.subscribers.remove(senderName);
+						this.subscribers.remove(senderName, subscriber);
 						releaseSubscriberEndpoint(senderName, (KurentoParticipant) sender, subscriber, null, false);
 						return null;
 					}
@@ -291,7 +305,7 @@ public class KurentoParticipant extends Participant {
 					final SubscriberEndpoint subscriber = initByServer ? getSubscriber(senderName)
 							: initializeSubscriberEndpoint(kSender);
 
-					if (subscriber.getEndpoint() == null) {
+					if (subscriber == null || subscriber.isDisposed() || subscriber.getEndpoint() == null) {
 						throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE,
 								"Unable to create subscriber endpoint");
 					}
@@ -314,7 +328,7 @@ public class KurentoParticipant extends Participant {
 						} else {
 							log.error("Exception connecting subscriber endpoint to publisher endpoint", e);
 						}
-						this.subscribers.remove(senderName);
+						this.subscribers.remove(senderName, subscriber);
 						releaseSubscriberEndpoint(senderName, (KurentoParticipant) sender, subscriber, null, false);
 						return null;
 					}
@@ -401,7 +415,7 @@ public class KurentoParticipant extends Participant {
 			final String remoteParticipantName = entry.getKey();
 			final SubscriberEndpoint subscriber = entry.getValue();
 			it.remove();
-			if (subscriber != null && subscriber.getEndpoint() != null) {
+			if (subscriber != null) {
 
 				try {
 					releaseSubscriberEndpoint(remoteParticipantName,
@@ -409,9 +423,11 @@ public class KurentoParticipant extends Participant {
 							subscriber, reason, false);
 					log.debug("PARTICIPANT {}: Released subscriber endpoint to {}", this.getParticipantPublicId(),
 							remoteParticipantName);
-				} catch (JsonRpcException e) {
+				} catch (RuntimeException e) {
 					log.error("Error releasing subscriber endpoint of participant {}: {}", this.participantPublicId,
 							e.getMessage());
+				} finally {
+					subscriber.disposeEndpoint();
 				}
 			} else {
 				log.warn(
@@ -420,7 +436,7 @@ public class KurentoParticipant extends Participant {
 						this.getParticipantPublicId(), remoteParticipantName);
 			}
 		}
-		if (publisher != null && publisher.getEndpoint() != null) {
+		if (publisher != null) {
 			releasePublisherEndpoint(reason, kmsDisconnectionTime);
 		}
 	}
@@ -485,10 +501,17 @@ public class KurentoParticipant extends Participant {
 				senderName);
 
 		SubscriberEndpoint subscriber = getNewOrExistingSubscriber(senderName);
+		// Reject duplicates before the cleanup catch: the first request still owns this endpoint.
+		if (!subscriber.tryStartInitialization()) {
+			record(DUPLICATE_SUBSCRIPTION);
+			log.warn("PARTICIPANT {}: Duplicate subscription to {} in room {}; preserving existing endpoint",
+					getParticipantPublicId(), senderName, session.getSessionId());
+			throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Subscription already exists or is being created");
+		}
 
 		try {
 			CountDownLatch subscriberLatch = new CountDownLatch(1);
-			Endpoint oldMediaEndpoint = subscriber.createEndpoint(subscriberLatch);
+			subscriber.createEndpoint(subscriberLatch);
 
 			try {
 				if (!subscriberLatch.await(KurentoSession.ASYNC_LATCH_TIMEOUT, TimeUnit.SECONDS)) {
@@ -496,17 +519,11 @@ public class KurentoParticipant extends Participant {
 							"Timeout reached when creating subscriber endpoint");
 				}
 			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
 				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE,
 						"Interrupted when creating subscriber endpoint: " + e.getMessage());
 			}
-			if (oldMediaEndpoint != null) {
-				log.warn(
-						"PARTICIPANT {}: Two threads are trying to create at "
-								+ "the same time a subscriber endpoint for user {}",
-						this.getParticipantPublicId(), senderName);
-				return null;
-			}
-			if (subscriber.getEndpoint() == null) {
+			if (subscriber.isDisposed() || subscriber.getEndpoint() == null) {
 				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Unable to create subscriber endpoint");
 			}
 
@@ -518,8 +535,9 @@ public class KurentoParticipant extends Participant {
 
 			endpointConfig.addEndpointListeners(subscriber, "subscriber");
 
-		} catch (OpenViduException e) {
-			this.subscribers.remove(senderName);
+		} catch (RuntimeException e) {
+			this.subscribers.remove(senderName, subscriber);
+			subscriber.disposeEndpoint();
 			throw e;
 		}
 
@@ -529,7 +547,14 @@ public class KurentoParticipant extends Participant {
 	}
 
 	private void releasePublisherEndpoint(EndReason reason, Long kmsDisconnectionTime) {
-		if (publisher != null && publisher.getEndpoint() != null) {
+		if (publisher != null) {
+			if (publisher.getEndpoint() == null) {
+				publisher.disposeEndpoint();
+				for (MediaElement element : publisher.getMediaElements()) {
+					releaseElement(getParticipantPublicId(), element);
+				}
+				return;
+			}
 			try {
 				final Lock closingWriteLock = publisher.closingLock.writeLock();
 				if (closingWriteLock.tryLock(15, TimeUnit.SECONDS)) {
@@ -538,8 +563,13 @@ public class KurentoParticipant extends Participant {
 					} finally {
 						closingWriteLock.unlock();
 					}
+				} else {
+					record(PUBLISHER_LOCK_TIMEOUT);
+					log.error("PARTICIPANT {}: Publisher closing lock timed out; forcing endpoint release", participantPublicId);
+					this.releasePublisherEndpointAux(reason, kmsDisconnectionTime);
 				}
 			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
 				log.error(
 						"Timeout wating for PublisherEndpoint closing lock of participant {} to be available to call releasePublisherEndpoint",
 						this.participantPublicId, this.getParticipantPublicId());
@@ -552,35 +582,44 @@ public class KurentoParticipant extends Participant {
 	}
 
 	private void releasePublisherEndpointAux(EndReason reason, Long kmsDisconnectionTime) {
+		final PublisherEndpoint releasingPublisher = publisher;
+		if (releasingPublisher == null) return;
 		try {
 			// Remove streamId from publisher's map
-			this.session.publishedStreamIds.remove(this.getPublisherStreamId());
+			this.session.publishedStreamIds.remove(releasingPublisher.getStreamId());
 
 			this.streaming = false;
 			this.session.deregisterPublisher(this);
 
 			if (this.openviduConfig.isRecordingModuleEnabled() && this.token.record()
 					&& this.recordingManager.sessionIsBeingRecorded(session.getSessionId())) {
-				this.recordingManager.stopOneIndividualStreamRecording(session, this.getPublisherStreamId(),
+				this.recordingManager.stopOneIndividualStreamRecording(session, releasingPublisher.getStreamId(),
 						kmsDisconnectionTime);
 			}
 
-			publisher.cancelStatsLoop.set(true);
+			releasingPublisher.cancelStatsLoop.set(true);
 
 			// These operations are all remote
-			publisher.unregisterErrorListeners();
-			for (MediaElement el : publisher.getMediaElements()) {
-				releaseElement(getParticipantPublicId(), el);
+			try {
+				releasingPublisher.unregisterErrorListeners();
+			} catch (RuntimeException e) {
+				log.warn("PARTICIPANT {}: Listener removal failed; continuing publisher release", participantPublicId, e);
 			}
-			releaseElement(getParticipantPublicId(), publisher.getEndpoint());
-
 		} catch (JsonRpcException e) {
 			log.error("Error releasing publisher endpoint of participant {}: {}", this.participantPublicId,
 					e.getMessage());
+		} finally {
+			try {
+				for (MediaElement el : releasingPublisher.getMediaElements()) {
+					releaseElement(getParticipantPublicId(), el);
+				}
+			} finally {
+				releasingPublisher.disposeEndpoint();
+			}
 		}
 
-		endpointConfig.getCdr().stopPublisher(this.getParticipantPublicId(), publisher.getStreamId(), reason);
-		publisher = null;
+		endpointConfig.getCdr().stopPublisher(this.getParticipantPublicId(), releasingPublisher.getStreamId(), reason);
+		if (publisher == releasingPublisher) publisher = null;
 	}
 
 	private void releaseSubscriberEndpoint(String senderName, KurentoParticipant publisherParticipant,
@@ -588,14 +627,15 @@ public class KurentoParticipant extends Participant {
 
 		if (subscriber != null) {
 
-			subscriber.unregisterErrorListeners();
-			subscriber.cancelStatsLoop.set(true);
-
-			if (subscriber.getEndpoint() != null) {
-				releaseElement(senderName, subscriber.getEndpoint());
+			try {
+				subscriber.unregisterErrorListeners();
+			} catch (RuntimeException e) {
+				log.warn("PARTICIPANT {}: Listener removal failed; continuing subscriber release", participantPublicId, e);
+			} finally {
+				subscriber.disposeEndpoint();
 			}
 
-			if (!silent) {
+			if (!silent && subscriber.getStreamId() != null) {
 
 				// Stop PlayerEndpoint of IP CAM if last subscriber disconnected
 				if (publisherParticipant != null && publisherParticipant.publisher != null) {
@@ -634,23 +674,26 @@ public class KurentoParticipant extends Participant {
 		}
 	}
 
-	void releaseElement(final String senderName, final MediaElement element) {
+	public void releaseElement(final String senderName, final MediaElement element) {
 		final String eid = element.getId();
 		log.debug("PARTICIPANT {}: Releasing media element #{} for {}", getParticipantPublicId(), eid, senderName);
 		try {
 			if (!RemoteOperationUtils.mustSkipRemoteOperation()) {
+				record(RELEASE_REQUESTED);
 				final AtomicBoolean releaseCompleted = new AtomicBoolean(false);
 				element.release(new Continuation<Void>() {
 					@Override
 					public void onSuccess(Void result) throws Exception {
 						releaseCompleted.set(true);
+						record(RELEASE_SUCCEEDED);
 						log.info("PARTICIPANT {}: Released successfully media element #{} for {}",
 								getParticipantPublicId(), eid, senderName);
 					}
 
 					@Override
 					public void onError(Throwable cause) throws Exception {
-						releaseCompleted.set(true);
+						if (!releaseCompleted.compareAndSet(false, true)) return;
+						record(RELEASE_FAILED);
 						log.warn("PARTICIPANT {}: Could not release media element #{} for {}", getParticipantPublicId(),
 								eid, senderName, cause);
 						retryReleaseElement(senderName, element, eid, "after error");
@@ -658,6 +701,7 @@ public class KurentoParticipant extends Participant {
 				});
 				MEDIA_ELEMENT_RELEASE_WATCHDOG.schedule(() -> {
 					if (releaseCompleted.compareAndSet(false, true)) {
+						record(RELEASE_TIMEOUT);
 						log.error("PARTICIPANT {}: Media element #{} for {} release did not complete in 10 seconds",
 								getParticipantPublicId(), eid, senderName);
 						retryReleaseElement(senderName, element, eid, "after timeout");
@@ -665,28 +709,46 @@ public class KurentoParticipant extends Participant {
 				}, 10, TimeUnit.SECONDS);
 			}
 		} catch (Exception e) {
+			record(RELEASE_FAILED);
 			log.error("PARTICIPANT {}: Error calling release on elem #{} for {}", getParticipantPublicId(), eid,
 					senderName, e);
+			MEDIA_ELEMENT_RELEASE_WATCHDOG.schedule(() -> retryReleaseElement(senderName, element, eid,
+					"after synchronous error"), 1, TimeUnit.SECONDS);
 		}
 	}
 
 	private void retryReleaseElement(final String senderName, final MediaElement element, final String eid,
 			final String reason) {
+		final AtomicBoolean completed = new AtomicBoolean(false);
 		try {
+			record(RELEASE_RETRY);
+			MEDIA_ELEMENT_RELEASE_WATCHDOG.schedule(() -> {
+				if (completed.compareAndSet(false, true)) {
+					record(RELEASE_RETRY_TIMEOUT);
+					log.error("PARTICIPANT {}: Media release retry still pending after 10 seconds: {} ({})",
+							getParticipantPublicId(), eid, reason);
+				}
+			}, 10, TimeUnit.SECONDS);
 			element.release(new Continuation<Void>() {
 				@Override
 				public void onSuccess(Void result) throws Exception {
+					completed.set(true);
+					record(RELEASE_RETRY_SUCCEEDED);
 					log.info("PARTICIPANT {}: Released successfully media element #{} for {} on retry {}",
 							getParticipantPublicId(), eid, senderName, reason);
 				}
 
 				@Override
 				public void onError(Throwable retryCause) throws Exception {
+					completed.set(true);
+					record(RELEASE_RETRY_FAILED);
 					log.error("PARTICIPANT {}: Could not release media element #{} for {} on retry {}",
 							getParticipantPublicId(), eid, senderName, reason, retryCause);
 				}
 			});
 		} catch (Exception retryException) {
+			completed.set(true);
+			record(RELEASE_RETRY_FAILED);
 			log.error("PARTICIPANT {}: Error calling release retry on elem #{} for {} {}",
 					getParticipantPublicId(), eid, senderName, reason, retryException);
 		}

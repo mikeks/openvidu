@@ -1,0 +1,9 @@
+[Unit]
+Description=Lightweight Kurento and OpenVidu resource sample
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/openvidu/kms-diagnostics.py sample
+TimeoutStartSec=15
+Nice=10
+IOSchedulingClass=idle

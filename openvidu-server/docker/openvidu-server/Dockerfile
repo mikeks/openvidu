@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y \
   curl \
   wget \
   ffmpeg \
-  openjdk-11-jre \
+  openjdk-11-jdk-headless \
+  coreutils \
   coturn \
   redis-tools \
   dnsutils \

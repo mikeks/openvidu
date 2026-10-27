@@ -17,10 +17,12 @@
 
 package io.openvidu.server.kurento.endpoint;
 
+import static io.openvidu.server.kurento.endpoint.MediaLifecycleDiagnostics.record;
+import static io.openvidu.server.kurento.endpoint.MediaLifecycleDiagnostics.Event.*;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -82,9 +84,13 @@ public abstract class MediaEndpoint {
 
 	private EndpointType endpointType;
 
-	private WebRtcEndpoint webEndpoint = null;
-	private RtpEndpoint endpoint = null;
-	private PlayerEndpoint playerEndpoint = null;
+	private volatile WebRtcEndpoint webEndpoint = null;
+	private volatile RtpEndpoint endpoint = null;
+	private volatile PlayerEndpoint playerEndpoint = null;
+	private final Object lifecycleLock = new Object();
+	private boolean creationStarted;
+	private boolean disposed;
+	private CountDownLatch creationLatch;
 
 	private final int maxRecvKbps;
 	private final int minRecvKbps;
@@ -103,7 +109,7 @@ public abstract class MediaEndpoint {
 
 	private final List<IceCandidate> receivedCandidateList = Collections.synchronizedList(new ArrayList<>());
 	private final List<IceCandidate> gatheredCandidateList = Collections.synchronizedList(new ArrayList<>());
-	private LinkedList<IceCandidate> candidates = new LinkedList<IceCandidate>();
+	private final Queue<IceCandidate> candidates = new ConcurrentLinkedQueue<>();
 
 
 	public String selectedLocalIceCandidate;
@@ -225,18 +231,68 @@ public abstract class MediaEndpoint {
 	 * @return the existing endpoint, if any
 	 */
 	public synchronized Endpoint createEndpoint(CountDownLatch endpointLatch) {
-		Endpoint old = this.getEndpoint();
-		if (old == null) {
+		synchronized (lifecycleLock) {
+			if (disposed) {
+				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Endpoint has been disposed");
+			}
+			Endpoint old = getEndpoint();
+			if (old != null) {
+				endpointLatch.countDown();
+				return old;
+			}
+			if (creationStarted) {
+				throw new OpenViduException(Code.MEDIA_ENDPOINT_ERROR_CODE, "Endpoint creation is already in progress");
+			}
+			creationStarted = true;
+			record(CREATE_STARTED);
+			creationLatch = endpointLatch;
+		}
+		try {
 			internalEndpointInitialization(endpointLatch);
-		} else {
+		} catch (RuntimeException e) {
+			record(INITIALIZATION_FAILED);
 			endpointLatch.countDown();
-			if (this.isWeb()) {
-				while (!candidates.isEmpty()) {
-					internalAddIceCandidate(candidates.removeFirst());
-				}
+			disposeEndpoint();
+			throw e;
+		}
+		return null;
+	}
+
+	public boolean isDisposed() {
+		synchronized (lifecycleLock) {
+			return disposed;
+		}
+	}
+
+	// A build callback can arrive after unsubscribe, close, or a creation timeout.
+	protected boolean acceptCreatedEndpoint(Endpoint result) {
+		record(CREATE_SUCCEEDED);
+		synchronized (lifecycleLock) {
+			if (!disposed) {
+				if (isWeb()) webEndpoint = (WebRtcEndpoint) result;
+				else if (isPlayerEndpoint()) playerEndpoint = (PlayerEndpoint) result;
+				else endpoint = (RtpEndpoint) result;
+				return true;
 			}
 		}
-		return old;
+		log.warn("EP {}: Releasing endpoint {} created after disposal", endpointName, result.getId());
+		record(LATE_CREATE);
+		owner.releaseElement(endpointName, result);
+		return false;
+	}
+
+	public void disposeEndpoint() {
+		Endpoint element;
+		synchronized (lifecycleLock) {
+			if (disposed) return;
+			disposed = true;
+			record(DISPOSED);
+			candidates.clear();
+			cancelStatsLoop.set(true);
+			if (creationLatch != null) creationLatch.countDown();
+			element = getEndpoint();
+		}
+		if (element != null) owner.releaseElement(endpointName, element);
 	}
 
 	/**
@@ -280,7 +336,7 @@ public abstract class MediaEndpoint {
 	 * instance.
 	 */
 	public synchronized void unregisterErrorListeners() {
-		unregisterElementErrListener(endpoint, endpointSubscription);
+		unregisterElementErrListener(getEndpoint(), endpointSubscription);
 	}
 
 	/**
@@ -298,73 +354,86 @@ public abstract class MediaEndpoint {
 			builder.buildAsync(new Continuation<WebRtcEndpoint>() {
 				@Override
 				public void onSuccess(WebRtcEndpoint result) throws Exception {
-					webEndpoint = result;
-
-					if (openviduConfig.getCoturnIp() != null && !openviduConfig.getCoturnIp().isEmpty()
-							&& openviduConfig.isTurnadminAvailable()) {
-						webEndpoint.setStunServerAddress(openviduConfig.getCoturnIp());
-						webEndpoint.setStunServerPort(3478);
+					if (!acceptCreatedEndpoint(result)) {
+						endpointLatch.countDown();
+						return;
 					}
 
-					endpointLatch.countDown();
+					try {
+						if (openviduConfig.getCoturnIp() != null && !openviduConfig.getCoturnIp().isEmpty()
+								&& openviduConfig.isTurnadminAvailable()) {
+							webEndpoint.setStunServerAddress(openviduConfig.getCoturnIp());
+							webEndpoint.setStunServerPort(3478);
+						}
 
-					while (!candidates.isEmpty()) {
-						internalAddIceCandidate(candidates.removeFirst());
+						endpointLatch.countDown();
+
+						IceCandidate candidate;
+						while ((candidate = candidates.poll()) != null) {
+							internalAddIceCandidate(candidate);
+						}
+
+						log.trace("EP {}: Created a new WebRtcEndpoint", endpointName);
+						endpointSubscription = registerElemErrListener(webEndpoint);
+
+						// This can be done after unlocking latch. Not necessary to wait
+						webEndpoint.setMaxVideoRecvBandwidth(maxRecvKbps, new Continuation<Void>() {
+							@Override
+							public void onSuccess(Void result) throws Exception {
+							}
+
+							@Override
+							public void onError(Throwable cause) throws Exception {
+								log.error("Error setting max video receive bandwidth for endpoint {}: {}", endpointName,
+										cause.getMessage());
+							}
+						});
+						webEndpoint.setMinVideoRecvBandwidth(minRecvKbps, new Continuation<Void>() {
+							@Override
+							public void onSuccess(Void result) throws Exception {
+							}
+
+							@Override
+							public void onError(Throwable cause) throws Exception {
+								log.error("Error setting min video receive bandwidth for endpoint {}: {}", endpointName,
+										cause.getMessage());
+							}
+						});
+						webEndpoint.setMaxVideoSendBandwidth(maxSendKbps, new Continuation<Void>() {
+							@Override
+							public void onSuccess(Void result) throws Exception {
+							}
+
+							@Override
+							public void onError(Throwable cause) throws Exception {
+								log.error("Error setting max video send bandwidth for endpoint {}: {}", endpointName,
+										cause.getMessage());
+							}
+						});
+						webEndpoint.setMinVideoSendBandwidth(minSendKbps, new Continuation<Void>() {
+							@Override
+							public void onSuccess(Void result) throws Exception {
+							}
+
+							@Override
+							public void onError(Throwable cause) throws Exception {
+								log.error("Error setting min video send bandwidth for endpoint {}: {}", endpointName,
+										cause.getMessage());
+							}
+						});
+					} catch (RuntimeException e) {
+						record(INITIALIZATION_FAILED);
+						log.error("EP {}: Failed to initialize created WebRtcEndpoint", endpointName, e);
+						disposeEndpoint();
+					} finally {
+						endpointLatch.countDown();
 					}
-
-					log.trace("EP {}: Created a new WebRtcEndpoint", endpointName);
-					endpointSubscription = registerElemErrListener(webEndpoint);
-
-					// This can be done after unlocking latch. Not necessary to wait
-					webEndpoint.setMaxVideoRecvBandwidth(maxRecvKbps, new Continuation<Void>() {
-						@Override
-						public void onSuccess(Void result) throws Exception {
-						}
-
-						@Override
-						public void onError(Throwable cause) throws Exception {
-							log.error("Error setting max video receive bandwidth for endpoint {}: {}", endpointName,
-									cause.getMessage());
-						}
-					});
-					webEndpoint.setMinVideoRecvBandwidth(minRecvKbps, new Continuation<Void>() {
-						@Override
-						public void onSuccess(Void result) throws Exception {
-						}
-
-						@Override
-						public void onError(Throwable cause) throws Exception {
-							log.error("Error setting min video receive bandwidth for endpoint {}: {}", endpointName,
-									cause.getMessage());
-						}
-					});
-					webEndpoint.setMaxVideoSendBandwidth(maxSendKbps, new Continuation<Void>() {
-						@Override
-						public void onSuccess(Void result) throws Exception {
-						}
-
-						@Override
-						public void onError(Throwable cause) throws Exception {
-							log.error("Error setting max video send bandwidth for endpoint {}: {}", endpointName,
-									cause.getMessage());
-						}
-					});
-					webEndpoint.setMinVideoSendBandwidth(minSendKbps, new Continuation<Void>() {
-						@Override
-						public void onSuccess(Void result) throws Exception {
-						}
-
-						@Override
-						public void onError(Throwable cause) throws Exception {
-							log.error("Error setting min video send bandwidth for endpoint {}: {}", endpointName,
-									cause.getMessage());
-						}
-					});
 				}
 
 				@Override
 				public void onError(Throwable cause) throws Exception {
 					endpointLatch.countDown();
+					record(CREATE_FAILED);
 					log.error("EP {}: Failed to create a new WebRtcEndpoint", endpointName, cause);
 				}
 			});
@@ -383,31 +452,42 @@ public abstract class MediaEndpoint {
 
 				@Override
 				public void onSuccess(PlayerEndpoint result) throws Exception {
-					playerEndpoint = result;
-
-					if (!mediaOptions.onlyPlayWithSubscribers) {
-						playerEndpoint.play(new Continuation<Void>() {
-							@Override
-							public void onSuccess(Void result) throws Exception {
-								log.info("IP Camera stream {} feed is now enabled", streamId);
-							}
-
-							@Override
-							public void onError(Throwable cause) throws Exception {
-								log.info("Error while enabling feed for IP camera {}: {}", streamId,
-										cause.getMessage());
-							}
-						});
+					if (!acceptCreatedEndpoint(result)) {
+						endpointLatch.countDown();
+						return;
 					}
 
-					log.trace("EP {}: Created a new PlayerEndpoint", endpointName);
-					endpointSubscription = registerElemErrListener(playerEndpoint);
-					endpointLatch.countDown();
+					try {
+						if (!mediaOptions.onlyPlayWithSubscribers) {
+							playerEndpoint.play(new Continuation<Void>() {
+								@Override
+								public void onSuccess(Void result) throws Exception {
+									log.info("IP Camera stream {} feed is now enabled", streamId);
+								}
+
+								@Override
+								public void onError(Throwable cause) throws Exception {
+									log.info("Error while enabling feed for IP camera {}: {}", streamId,
+											cause.getMessage());
+								}
+							});
+						}
+
+						log.trace("EP {}: Created a new PlayerEndpoint", endpointName);
+						endpointSubscription = registerElemErrListener(playerEndpoint);
+					} catch (RuntimeException e) {
+						record(INITIALIZATION_FAILED);
+						log.error("EP {}: Failed to initialize created PlayerEndpoint", endpointName, e);
+						disposeEndpoint();
+					} finally {
+						endpointLatch.countDown();
+					}
 				}
 
 				@Override
 				public void onError(Throwable cause) throws Exception {
 					endpointLatch.countDown();
+					record(CREATE_FAILED);
 					log.error("EP {}: Failed to create a new PlayerEndpoint", endpointName, cause);
 				}
 			});
@@ -415,7 +495,10 @@ public abstract class MediaEndpoint {
 			new RtpEndpoint.Builder(pipeline).buildAsync(new Continuation<RtpEndpoint>() {
 				@Override
 				public void onSuccess(RtpEndpoint result) throws Exception {
-					endpoint = result;
+					if (!acceptCreatedEndpoint(result)) {
+						endpointLatch.countDown();
+						return;
+					}
 					endpointLatch.countDown();
 					log.trace("EP {}: Created a new RtpEndpoint", endpointName);
 					endpointSubscription = registerElemErrListener(endpoint);
@@ -424,6 +507,7 @@ public abstract class MediaEndpoint {
 				@Override
 				public void onError(Throwable cause) throws Exception {
 					endpointLatch.countDown();
+					record(CREATE_FAILED);
 					log.error("EP {}: Failed to create a new RtpEndpoint", endpointName, cause);
 				}
 			});
@@ -437,11 +521,12 @@ public abstract class MediaEndpoint {
 	 * @param candidate the remote candidate
 	 */
 	public synchronized void addIceCandidate(IceCandidate candidate) throws OpenViduException {
+		if (isDisposed()) return;
 		if (!this.isWeb()) {
 			throw new OpenViduException(Code.MEDIA_NOT_A_WEB_ENDPOINT_ERROR_CODE, "Operation not supported");
 		}
 		if (webEndpoint == null) {
-			candidates.addLast(candidate);
+			candidates.add(candidate);
 		} else {
 			internalAddIceCandidate(candidate);
 		}
@@ -476,7 +561,16 @@ public abstract class MediaEndpoint {
 			return;
 		}
 		if (!RemoteOperationUtils.mustSkipRemoteOperation()) {
-			element.removeErrorListener(subscription);
+			// Listener cleanup must not hold up endpoint release while KMS is unresponsive.
+			element.removeErrorListener(subscription, new Continuation<Void>() {
+				@Override
+				public void onSuccess(Void result) { }
+
+				@Override
+				public void onError(Throwable cause) {
+					log.warn("EP {}: Could not remove error listener from {}", endpointName, element.getId(), cause);
+				}
+			});
 		}
 	}
 

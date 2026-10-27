@@ -18,6 +18,7 @@
 package io.openvidu.server.kurento.endpoint;
 
 import java.util.Map.Entry;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.kurento.client.MediaPipeline;
 import org.kurento.client.OfferOptions;
@@ -41,6 +42,11 @@ public class SubscriberEndpoint extends MediaEndpoint {
 	private final static Logger log = LoggerFactory.getLogger(SubscriberEndpoint.class);
 
 	private String publisherStreamId;
+	private final AtomicBoolean initializationStarted = new AtomicBoolean();
+
+	public boolean tryStartInitialization() {
+		return initializationStarted.compareAndSet(false, true);
+	}
 
 	public SubscriberEndpoint(EndpointType endpointType, KurentoParticipant owner, String endpointName,
 			MediaPipeline pipeline, OpenviduConfig openviduConfig) {

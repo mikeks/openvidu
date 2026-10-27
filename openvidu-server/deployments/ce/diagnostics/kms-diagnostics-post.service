@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect persisted Kurento incident logs after recovery
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/openvidu/kms-diagnostics.py post-restart
+TimeoutStartSec=90
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

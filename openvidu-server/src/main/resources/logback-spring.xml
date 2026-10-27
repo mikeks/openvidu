@@ -2,6 +2,7 @@
 <configuration>
 
 	<springProperty scope="context" name="cdrPath" source="OPENVIDU_CDR_PATH" />
+	<springProperty scope="context" name="diagnosticsPath" source="OPENVIDU_DIAGNOSTICS_PATH" defaultValue="" />
 
 	<timestamp key="myTimestamp" timeReference="contextBirth"
 		datePattern="HH-mm-ss" />
@@ -37,6 +38,25 @@
 		<level value="INFO" />
 		<appender-ref ref="STDOUT" />
 	</root>
+	<logger name="io.openvidu.server.kurento.endpoint.MediaLifecycleDiagnostics" level="INFO" />
+	<if condition='!property("diagnosticsPath").isEmpty()'>
+		<then>
+			<appender name="DIAGNOSTICS" class="ch.qos.logback.core.rolling.RollingFileAppender">
+				<file>${diagnosticsPath}/openvidu.log</file>
+				<rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+					<fileNamePattern>${diagnosticsPath}/openvidu.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+					<maxFileSize>20MB</maxFileSize>
+					<maxHistory>7</maxHistory>
+					<totalSizeCap>200MB</totalSizeCap>
+					<cleanHistoryOnStart>true</cleanHistoryOnStart>
+				</rollingPolicy>
+				<encoder>
+					<pattern>[%p] %d{yyyy-MM-dd'T'HH:mm:ss.SSS,UTC}Z [%t] %c - %msg%n</pattern>
+				</encoder>
+			</appender>
+			<root><appender-ref ref="DIAGNOSTICS" /></root>
+		</then>
+	</if>
 	<if condition='property("OPENVIDU_CDR").equalsIgnoreCase("true")'>
 		<then>
 			<appender name="CDR"

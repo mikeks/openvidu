@@ -101,6 +101,11 @@ public class PublisherEndpoint extends MediaEndpoint {
 		super.internalEndpointInitialization(endpointLatch);
 		if (this.passThru == null) {
 			passThru = new PassThrough.Builder(getPipeline()).build();
+			if (isDisposed()) {
+				((KurentoParticipant) getOwner()).releaseElement(getEndpointName(), passThru);
+				passThru = null;
+				return;
+			}
 			passThruSubscription = registerElemErrListener(passThru);
 		}
 	}
