@@ -1,0 +1,17 @@
+[Unit]
+Description=Bounded Kurento native cleanup stall capture (opt-in)
+After=docker.service
+
+[Service]
+Type=simple
+# Replace the log path with the current-file symlink maintained by log rotation.
+# Separate from watchdog: it must never be an ExecStartPre/ExecStop dependency.
+ExecStart=/usr/bin/python3 /opt/openvidu/diagnostics/kms-stall-stacks.py --log /opt/openvidu/kurento-logs/current.log --native-stacks
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=3
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

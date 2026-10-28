@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded host-side telemetry. Does not change containers or restart services."""
 import argparse
+from collections import Counter
 import datetime as dt
 import fcntl
 import json
@@ -14,6 +15,71 @@ import time
 
 CONTAINERS = {"kms": "openvidu_kms_1", "ov": "openvidu_openvidu-server_1"}
 MAX_FILE = 2 * 1024 * 1024
+MAX_NATIVE_STACK_THREADS = 4096
+
+
+def fd_snapshot(pid, seconds=0.1, limit=1024):
+    deadline = time.monotonic() + seconds
+    kinds = Counter()
+    scanned = 0
+    truncated = False
+    try:
+        with os.scandir('/proc/%s/fd' % pid) as entries:
+            for entry in entries:
+                if scanned >= limit or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                try:
+                    target = os.readlink(entry.path)
+                    if target.startswith(('socket:', 'pipe:')):
+                        kind = target.split(':', 1)[0]
+                    elif target.startswith('anon_inode:'):
+                        kind = target[:80]
+                    else:
+                        kind = 'file_or_other'
+                except OSError:
+                    kind = 'unavailable'
+                kinds[kind] += 1
+                scanned += 1
+    except OSError as error:
+        return {'error': str(error)}
+    # Do not record file paths, socket addresses or descriptor contents.
+    return {'scanned': scanned, 'truncated': truncated,
+            'selection': 'proc directory order; not a random or full census', 'kinds': dict(kinds)}
+
+
+def thread_snapshot(pid, seconds=0.25, limit=2048, kernel_stacks=False):
+    """Non-pausing, bounded sample; counts describe scanned threads, not the process."""
+    deadline = time.monotonic() + seconds
+    groups = Counter()
+    representatives = []
+    scanned = 0
+    truncated = False
+    try:
+        with os.scandir('/proc/%s/task' % pid) as tasks:
+            for task in tasks:
+                if scanned >= limit or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                root = Path(task.path)
+                name = read_text(root / 'comm', 128).strip()
+                wait = read_text(root / 'wchan', 128).strip()
+                key = (name, wait)
+                if not groups[key] and len(representatives) < 12:
+                    item = {'tid': task.name, 'name': name, 'wait': wait,
+                            'stat': read_text(root / 'stat', 2048)}
+                    if kernel_stacks:
+                        item['kernel_stack'] = read_text(root / 'stack', 4096)
+                    representatives.append(item)
+                groups[key] += 1
+                scanned += 1
+    except OSError as error:
+        return {'error': str(error)}
+    return {'scanned': scanned, 'truncated': truncated,
+            'selection': 'proc directory order; not a random or full census',
+            'groups': [{'name': name, 'wait': wait, 'count': count}
+                       for (name, wait), count in groups.most_common(32)],
+            'representatives': representatives}
 
 
 def utc_now():
@@ -83,13 +149,18 @@ def resume_detached_process(pid, identity):
 
 
 def sample():
-    return {"utc": utc_now().isoformat(), "loadavg": read_text("/proc/loadavg"),
+    result = {"utc": utc_now().isoformat(), "loadavg": read_text("/proc/loadavg"),
             "meminfo": read_text("/proc/meminfo"), "vmstat": read_text("/proc/vmstat"),
             "pressure_cpu": read_text("/proc/pressure/cpu"),
             "pressure_memory": read_text("/proc/pressure/memory"),
             "pressure_io": read_text("/proc/pressure/io"),
             "processes": {key: process_stats(find_pid(container, "java" if key == "ov" else "kurento"))
                           for key, container in CONTAINERS.items()}}
+    kms = result['processes']['kms']
+    if kms.get('pid'):
+        kms['threads'] = thread_snapshot(kms['pid'])
+        kms['descriptors'] = fd_snapshot(kms['pid'])
+    return result
 
 
 def keep_latest(root, pattern, count, directories=False):
@@ -155,11 +226,25 @@ def incident(root, native_stacks):
     (directory / "sources.json").write_text(json.dumps(sources))
     kms_pid = find_pid(CONTAINERS["kms"], "kurento", timeout=0.5)
     (directory / "process.json").write_text(json.dumps({"utc": utc_now().isoformat(), "kms_pid": kms_pid}))
-    if kms_pid and native_stacks:
+    # GDB may spend the entire deadline attaching to thousands of threads.
+    # Preserve cheap evidence before attempting an all-thread native backtrace.
+    threads = 0
+    if kms_pid:
+        stats = process_stats(kms_pid)
+        (directory / "kms-process.json").write_text(json.dumps(stats))
+        (directory / "kms-fds.json").write_text(json.dumps(fd_snapshot(
+            kms_pid, seconds=max(0, min(0.1, deadline - time.monotonic())))))
+        (directory / "kms-maps.txt").write_text(read_text("/proc/%s/maps" % kms_pid, MAX_FILE))
+        (directory / "kms-threads.json").write_text(json.dumps(
+            thread_snapshot(kms_pid, seconds=max(0, min(0.25, deadline - time.monotonic())),
+                            kernel_stacks=True)))
+        threads = int(stats.get('status', {}).get('Threads', '0'))
+    if kms_pid and native_stacks and threads <= MAX_NATIVE_STACK_THREADS:
         identity = process_identity(kms_pid)
         try:
             capture(directory / "kms-backtrace.txt", ["gdb", "-nx", "-batch",
                 "-ex", "set pagination off", "-ex", "set auto-load off",
+                "-ex", "set print thread-events off",
                 "-ex", "set debug-file-directory /nonexistent",
                 "-ex", "set print frame-arguments none",
                 "-ex", "set sysroot /proc/%s/root" % kms_pid,
@@ -169,12 +254,9 @@ def incident(root, native_stacks):
             # GDB interrupted during symbol loading can detach leaving SIGSTOP set.
             resume_detached_process(kms_pid, identity)
     else:
-        (directory / "kms-backtrace.txt").write_text("Skipped: KMS not found or native stacks disabled\n")
-    if kms_pid and time.monotonic() < deadline:
-        (directory / "kms-process.json").write_text(json.dumps(process_stats(kms_pid)))
-        (directory / "kms-maps.txt").write_text(read_text("/proc/%s/maps" % kms_pid, MAX_FILE))
-        capture(directory / "threads.txt", ["ps", "-L", "-p", str(kms_pid), "-o",
-                "pid,tid,pcpu,stat,wchan:40,comm"], deadline)
+        reason = ("thread count %s exceeds bounded attach limit %s" % (threads, MAX_NATIVE_STACK_THREADS)
+                  if threads > MAX_NATIVE_STACK_THREADS else "KMS not found or native stacks disabled")
+        (directory / "kms-backtrace.txt").write_text("Skipped: " + reason + "\n")
     print(directory)
 
 
@@ -230,7 +312,7 @@ def main():
             post_restart(args.root)
         else:
             path = args.root / ("sample-" + utc_now().strftime("%Y%m%d") + ".jsonl")
-            if not path.exists() or path.stat().st_size < 16 * 1024 * 1024:
+            if not path.exists() or path.stat().st_size < 32 * 1024 * 1024:
                 with path.open("a") as output:
                     output.write(json.dumps(sample(), separators=(",", ":")) + "\n")
             keep_latest(args.root, "sample-*.jsonl", 7)

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 import sys
@@ -13,6 +14,58 @@ spec.loader.exec_module(diagnostics)
 
 
 class DiagnosticsTest(unittest.TestCase):
+    def test_fd_snapshot_bounded_and_no_paths(self):
+        result = diagnostics.fd_snapshot(os.getpid(), limit=2)
+        self.assertEqual(2, result['scanned'])
+        self.assertEqual(2, sum(result['kinds'].values()))
+        self.assertTrue(result['truncated'])
+        self.assertFalse(any('/' in key for key in result['kinds']))
+
+    def test_fd_snapshot_deadline_and_missing_process(self):
+        result = diagnostics.fd_snapshot(os.getpid(), seconds=0)
+        self.assertEqual(0, result['scanned'])
+        self.assertTrue(result['truncated'])
+        self.assertIn('error', diagnostics.fd_snapshot(-1))
+
+    def test_thread_snapshot_is_bounded_and_does_not_attach(self):
+        with patch.object(diagnostics, 'command') as command:
+            result = diagnostics.thread_snapshot(os.getpid(), limit=1)
+            self.assertEqual(1, result['scanned'])
+            self.assertEqual(1, sum(g['count'] for g in result['groups']))
+            self.assertNotIn('kernel_stack', result['representatives'][0])
+            command.assert_not_called()
+
+    def test_thread_snapshot_deadline_and_missing_process(self):
+        result = diagnostics.thread_snapshot(os.getpid(), seconds=0)
+        self.assertEqual(0, result['scanned'])
+        self.assertTrue(result['truncated'])
+        self.assertIn('error', diagnostics.thread_snapshot(-1))
+
+    def test_incident_thread_explosion_skips_debugger_but_keeps_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(diagnostics, 'find_pid', return_value=os.getpid()), \
+                    patch.object(diagnostics, 'process_stats', return_value={'status': {'Threads': '20357'}}), \
+                    patch.object(diagnostics, 'capture') as capture:
+                diagnostics.incident(Path(temp), True)
+                directory = next(Path(temp).glob('incident-*'))
+                self.assertTrue((directory / 'kms-process.json').exists())
+                self.assertTrue((directory / 'kms-maps.txt').exists())
+                self.assertTrue((directory / 'kms-threads.json').exists())
+                self.assertIn('20357', (directory / 'kms-backtrace.txt').read_text())
+                capture.assert_not_called()
+
+    def test_incident_saves_lightweight_evidence_before_debugger(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def capture(path, *args, **kwargs):
+                self.assertTrue((path.parent / 'kms-process.json').exists())
+                self.assertTrue((path.parent / 'kms-threads.json').exists())
+                self.assertTrue((path.parent / 'kms-fds.json').exists())
+                self.assertTrue((path.parent / 'kms-maps.txt').exists())
+            with patch.object(diagnostics, 'find_pid', return_value=os.getpid()), \
+                    patch.object(diagnostics, 'capture', side_effect=capture), \
+                    patch.object(diagnostics, 'resume_detached_process'):
+                diagnostics.incident(Path(temp), True)
+
     def test_resume_only_same_detached_process(self):
         with patch.object(diagnostics, "process_identity", return_value="123"), \
                 patch.object(diagnostics, "read_text", return_value="TracerPid:\t0\n"), \

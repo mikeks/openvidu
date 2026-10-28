@@ -17,7 +17,7 @@ Requires Python 3, Docker CLI, procps, and host access to `/proc`.
 Every minute it saves cumulative CPU/IO counters, memory, threads, file descriptor
 count, host memory/load/pressure and the process PID. Compare deltas only within
 the same PID lifetime. No media requests, DB writes or debugger attachment occur.
-There are at most seven daily sample files, capped at 16 MiB each. Failure to
+There are at most seven daily sample files, capped at 32 MiB each. Failure to
 find the process is explicit, not represented as zero resource usage.
 
 ## Capture before watchdog destroys containers
@@ -41,8 +41,11 @@ timeout allows four seconds plus one second to terminate helpers: **five seconds
 maximum added delay under normal OS scheduling**, not a real-time guarantee if
 the host itself is stuck in uninterruptible IO. KMS PID lookup has a 0.5-second
 timeout. Native stacks get the remaining shared three-second working budget;
-helper termination has a one-second allowance. Lightweight process state is
-captured only if time remains. Missing tools never intentionally block recovery.
+helper termination has a one-second allowance. Lightweight process state, maps,
+and a bounded thread sample are saved BEFORE attempting GDB. Above 4,096 threads
+GDB is skipped with an explicit reason: attaching thousands of threads can use
+the entire deadline without producing any stack. This is a diagnostic budget
+guard, not a restart or health threshold. Missing tools never intentionally block recovery.
 Timeouts can leave partial stacks; `Capture timed out` or an interrupted file
 must not be interpreted as a complete dump.
 
@@ -57,7 +60,27 @@ incident. Java stacks and Docker metadata capture are omitted from this fast
 path; do not mistake new-process stacks for evidence about the old stall.
 Latest ten incident folders are retained when deferred collection runs (a new
 pending folder can temporarily exceed this). Each output is capped at 2 MiB.
-Samples plus incidents are bounded to roughly 400 MiB (normal use much less).
+Samples plus incidents are bounded to roughly 500 MiB (normal use much less).
+
+The minute sampler also records a non-pausing KMS thread sample (at most 2,048
+threads and 250 ms of scan budget). It groups thread names and kernel wait
+channels and retains up to twelve representative thread stat records. Counts
+are explicitly partial, in proc directory order, not a random sample or an exact
+census. Full thread count remains in process status. The incident snapshot adds
+bounded kernel stacks for these representatives; these are NOT native user-space
+backtraces and cannot identify a userspace mutex owner. Proc reads can fail as
+threads exit or because of kernel permissions. No new production dependencies,
+KMS requests, debugger attachment during sampling, or automatic restarts are added.
+The watchdog's existing outer five-second bound is unchanged.
+Descriptor categories are also sampled (at most 1,024 entries / 100 ms): sockets,
+pipes, anonymous kernel descriptors, and other files. Paths and contents are not
+saved. Like the thread sample, this is a partial census, not an exact count per
+category. The existing status fd_count remains the complete descriptor count.
+
+Staged locally on 2026-10-28; not deployed. The existing production watchdog
+tests HTTP 426 at /jsonrpc, which confirms HTTP/WebSocket upgrade handling only.
+It does not establish that create/release/media processing work. Do not interpret
+its successful probe as proof that clients can connect or media is healthy.
 
 The native capture requires **GDB on the host**, root ptrace access, and ideally
 debug symbols matching the exact KMS image and its libraries. It uses the
