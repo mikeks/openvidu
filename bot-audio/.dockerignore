@@ -1,0 +1,7 @@
+.env
+bin/
+obj/
+data/
+models/
+*.log
+*.tar.gz

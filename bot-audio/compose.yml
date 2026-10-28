@@ -1,0 +1,25 @@
+services:
+  bot-audio:
+    build: .
+    image: mafia-bot-audio:local
+    network_mode: host
+    env_file: .env
+    environment:
+      BOT_AUDIO_MODEL: /app/models/silero_vad.onnx
+    volumes:
+      - ./data/stt-dry-run:/data/stt-dry-run
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
