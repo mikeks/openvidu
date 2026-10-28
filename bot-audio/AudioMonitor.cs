@@ -32,6 +32,7 @@ public sealed class AudioMonitor : BackgroundService
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic",
             Convert.ToBase64String(Encoding.UTF8.GetBytes("OPENVIDUAPP:" + secret)));
     }
+    public StreamLoad Load { get; } = new();
     public int StreamCount => streams.Count;
     public object Status() => new { instanceId = InstanceId, controlErrors = Interlocked.Read(ref controlErrors),
         delivery = new { delivery.Delivered, delivery.Failed, delivery.Rejected, delivery.SttFailed }, streamCount = streams.Count, maxStreams, streams = streams.Values.Select(s => s.Snapshot()).ToArray() };
@@ -83,6 +84,7 @@ public sealed class AudioMonitor : BackgroundService
         foreach(var entry in wanted) if(!streams.ContainsKey(entry.Key)) {
             var a=entry.Value.Assignment;
             streams[entry.Key]=new AudioStream(a.SessionId,a.ConnectionId,entry.Value.Stream,model,a,s=>delivery.Submit(s));
+            Load.Change(1);
             observed.Add(AssignmentKey(a));
         }        await Parallel.ForEachAsync(streams.ToArray(),
             new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = stop }, async (entry, token) => {
@@ -103,6 +105,7 @@ public sealed class AudioMonitor : BackgroundService
     async Task Remove(string key)
     {
         if (!streams.TryRemove(key, out var stream)) return;
+        Load.Change(-1);
         await stream.DisposeAsync();
         try { using var response = await http.DeleteAsync("bot-audio/" + stream.LeaseId); }
         catch (Exception) { /* server lease expires even after kill -9 */ }

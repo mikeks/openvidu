@@ -21,6 +21,7 @@ public static class SelfTest
     public static void Run()
     {
         SpeechAnalysisTest.Run();
+        StreamLoadTest.Run();
         var tiny = Enumerable.Repeat(2f/32768,256).ToArray();
         var quietVoice = Enumerable.Repeat(.001f,256).ToArray(); // -60 dBFS
         Check(!SpeechEnergy.IsAudible(tiny) && SpeechEnergy.IsAudible(quietVoice), "near-silence energy boundary");

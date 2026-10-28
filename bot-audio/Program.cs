@@ -24,9 +24,11 @@ app.MapGet("/status", (AudioMonitor monitor) => {
         audio=monitor.Status() });
 });
 var metricsClock = Stopwatch.StartNew();
-app.MapGet("/metrics", (AudioMonitor monitor) => {
+app.MapGet("/metrics", (AudioMonitor monitor, HttpRequest request) => {
+    var load = monitor.Load.Sample(request.Query["sample"] == "1");
     using var process = Process.GetCurrentProcess();
     return Results.Ok(new { instanceId=monitor.InstanceId, uptimeSeconds=metricsClock.Elapsed.TotalSeconds,
-        cpuSeconds=process.TotalProcessorTime.TotalSeconds, rssBytes=process.WorkingSet64, streamCount=monitor.StreamCount });
+        cpuSeconds=process.TotalProcessorTime.TotalSeconds, rssBytes=process.WorkingSet64, streamCount=load.Current,
+        streamAverage=load.Average, streamPeak=load.Peak, streamSampleSeconds=load.Seconds });
 });
 app.Run();
