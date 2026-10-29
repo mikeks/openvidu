@@ -4,9 +4,9 @@ After=docker.service
 
 [Service]
 Type=simple
-# Replace the log path with the current-file symlink maintained by log rotation.
+# Follow the newest timestamp-named native log across rotation and restarts.
 # Separate from watchdog: it must never be an ExecStartPre/ExecStop dependency.
-ExecStart=/usr/bin/python3 /opt/openvidu/diagnostics/kms-stall-stacks.py --log /opt/openvidu/kurento-logs/current.log --native-stacks
+ExecStart=/usr/bin/python3 /opt/openvidu/diagnostics/kms-stall-stacks.py --log /opt/openvidu/kurento-logs --native-stacks
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=3

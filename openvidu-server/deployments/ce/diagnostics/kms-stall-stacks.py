@@ -151,22 +151,23 @@ quit
             except subprocess.TimeoutExpired:
                 outcome = 'timeout'
     finally:
-        if proc and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=.2)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=.5)
-        # Interrupted GDB can detach leaving SIGSTOP set. Never signal a reused PID
-        # or a process still being traced by another debugger.
-        if proc and old_identity and identity(pid) == old_identity:
-            status = read('/proc/%s/status' % pid)
-            if re.search(r'^TracerPid:\s+0$', status, re.M):
+        try:
+            if proc and proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
                 try:
-                    os.kill(pid, signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
+                    proc.wait(timeout=.2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=.5)
+        finally:
+            # Attempt resumption even if debugger termination itself times out.
+            if proc and old_identity and identity(pid) == old_identity:
+                status = read('/proc/%s/status' % pid)
+                if re.search(r'^TracerPid:\s+0$', status, re.M):
+                    try:
+                        os.kill(pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
     cpu_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     trace = read(directory / 'native.txt', MAX_BYTES)
     selected = sorted(set(int(tid) for tid in re.findall(r'SELECTED_HOST_TID=(\d+)', trace)))
@@ -226,18 +227,19 @@ def capture(pid, items, root, native=False, budget=CAPTURE_SECONDS):
 
 
 def follow(path):
-    """Poll a current log symlink/file, bounded reads; ignore old logs on startup."""
+    """Follow a file or newest timestamp-named log; ignore history on startup."""
     key, offset, partial = None, 0, b''
     while True:
         try:
-            stat = path.stat()
+            source = max(path.glob('*.log')) if path.is_dir() else path
+            stat = source.stat()
             current = (stat.st_dev, stat.st_ino)
             if key is None:
                 offset = stat.st_size
             elif current != key or stat.st_size < offset:
                 offset, partial = 0, b''
             key = current
-            with path.open('rb') as stream:
+            with source.open('rb') as stream:
                 # Skip an excessive backlog rather than attach for stale evidence.
                 if stat.st_size - offset > 256 * 1024:
                     offset, partial = stat.st_size, b''
@@ -248,14 +250,14 @@ def follow(path):
             partial = lines.pop()[-8192:]
             for line in lines:
                 yield line[-8192:].decode('utf-8', errors='replace')
-        except OSError:
+        except (OSError, ValueError):
             pass
         time.sleep(5)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--log', type=Path, required=True, help='current KMS log file or rotating symlink')
+    parser.add_argument('--log', type=Path, required=True, help='KMS log file, symlink or timestamp-named log directory')
     parser.add_argument('--container', default='openvidu_kms_1')
     parser.add_argument('--root', type=Path, default=Path('/opt/openvidu/diagnostics/native-stalls'))
     parser.add_argument('--native-stacks', action='store_true')
